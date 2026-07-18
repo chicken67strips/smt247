@@ -1,0 +1,17 @@
+{
+  "name": "godly-exchange-fictional-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dedicated Railway backend for the fictional-stock Roblox game",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
