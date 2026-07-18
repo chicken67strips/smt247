@@ -95,10 +95,35 @@ const CRYPTO_IDS = {
   DOGE: "dogecoin",
   LTC: "litecoin"
 };
+const COINBASE_PRODUCTS = {
+  BTC: "BTC-USD",
+  ETH: "ETH-USD",
+  SOL: "SOL-USD",
+  DOGE: "DOGE-USD",
+  LTC: "LTC-USD"
+};
 const cryptoPriceCache = {};
 const cryptoCandleCache = new Map();
 const CRYPTO_PRICE_TTL_MS = 1500;
 const CRYPTO_CANDLE_TTL_MS = 8000;
+const CRYPTO_PROVIDER_MAX_AGE_MS = 2 * 60 * 1000;
+const COINGECKO_PROVIDER_MAX_AGE_MS = 5 * 60 * 1000;
+
+function cryptoProviderTimeIsCurrent(timestampMs, maxAgeMs = CRYPTO_PROVIDER_MAX_AGE_MS) {
+  const value = Number(timestampMs);
+  if (!Number.isFinite(value) || value <= 0) return false;
+  const age = Date.now() - value;
+  return age >= -30000 && age <= maxAgeMs;
+}
+
+function cryptoRowIsCurrent(row, maxAgeMs = COINGECKO_PROVIDER_MAX_AGE_MS) {
+  if (!row || !(asNumber(row.price) > 0)) return false;
+  const providerTimeMs = (asNumber(row.lastUpdated) || 0) * 1000;
+  const receivedAtMs = asNumber(row.receivedAtMs) || 0;
+  return cryptoProviderTimeIsCurrent(providerTimeMs, maxAgeMs)
+    && receivedAtMs > 0
+    && Date.now() - receivedAtMs <= maxAgeMs;
+}
 
 function normalizeCryptoSymbol(value) {
   const symbol = String(value || "").toUpperCase().replace(/[^A-Z]/g, "");
@@ -114,13 +139,63 @@ async function fetchBinanceTicker(symbol, host) {
   if (!response.ok || !response.data) throw new Error(`${host} HTTP ${response.status}`);
   const price = asNumber(response.data.lastPrice);
   if (!(price > 0)) throw new Error(`${host} returned no price`);
+  const providerTimeMs = asNumber(response.data.closeTime);
+  if (!cryptoProviderTimeIsCurrent(providerTimeMs)) {
+    throw new Error(`${host} returned a stale ${symbol} quote`);
+  }
   return {
     symbol,
     price,
     change24h: asNumber(response.data.priceChangePercent) || 0,
     volume24h: asNumber(response.data.quoteVolume) || 0,
     source: host.includes("binance.us") ? "Binance.US" : "Binance",
-    lastUpdated: Math.floor((asNumber(response.data.closeTime) || Date.now()) / 1000),
+    lastUpdated: Math.floor(providerTimeMs / 1000),
+    receivedAtMs: Date.now()
+  };
+}
+
+async function fetchCoinbaseTicker(symbol) {
+  const product = COINBASE_PRODUCTS[symbol];
+  if (!product) throw new Error(`Coinbase does not support ${symbol}`);
+
+  const [tickerResult, statsResult] = await Promise.allSettled([
+    fetchJson(
+      `https://api.exchange.coinbase.com/products/${encodeURIComponent(product)}/ticker`,
+      { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
+      7000
+    ),
+    fetchJson(
+      `https://api.exchange.coinbase.com/products/${encodeURIComponent(product)}/stats`,
+      { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
+      7000
+    )
+  ]);
+
+  if (tickerResult.status !== "fulfilled" || !tickerResult.value.ok) {
+    throw new Error(`Coinbase ${symbol} ticker unavailable`);
+  }
+
+  const ticker = tickerResult.value.data || {};
+  const price = asNumber(ticker.price);
+  const providerTimeMs = Date.parse(String(ticker.time || ""));
+  if (!(price > 0)) throw new Error(`Coinbase returned no ${symbol} price`);
+  if (!cryptoProviderTimeIsCurrent(providerTimeMs)) {
+    throw new Error(`Coinbase returned a stale ${symbol} trade`);
+  }
+
+  const stats = statsResult.status === "fulfilled" && statsResult.value.ok
+    ? (statsResult.value.data || {})
+    : {};
+  const open = asNumber(stats.open);
+  const baseVolume = asNumber(stats.volume);
+
+  return {
+    symbol,
+    price,
+    change24h: open > 0 ? ((price - open) / open) * 100 : 0,
+    volume24h: baseVolume >= 0 ? baseVolume * price : 0,
+    source: "Coinbase Exchange USD spot",
+    lastUpdated: Math.floor(providerTimeMs / 1000),
     receivedAtMs: Date.now()
   };
 }
@@ -137,7 +212,8 @@ async function fetchCoinGeckoPrices(symbols) {
   for (const symbol of symbols) {
     const row = response.data[CRYPTO_IDS[symbol]];
     const price = row && asNumber(row.usd);
-    if (price > 0) {
+    const providerTimeMs = row && asNumber(row.last_updated_at) * 1000;
+    if (price > 0 && cryptoProviderTimeIsCurrent(providerTimeMs, COINGECKO_PROVIDER_MAX_AGE_MS)) {
       rows[symbol] = {
         symbol,
         price,
@@ -155,14 +231,17 @@ async function fetchCoinGeckoPrices(symbols) {
 async function getCryptoPrices(symbols, force = false) {
   const now = Date.now();
   const wanted = symbols.filter(symbol => CRYPTO_SYMBOLS.includes(symbol));
-  const needs = wanted.filter(symbol => force || !cryptoPriceCache[symbol] || now - cryptoPriceCache[symbol].receivedAtMs > CRYPTO_PRICE_TTL_MS);
+  // Even with fresh=1, do not hammer ten provider endpoints every 1.25 seconds.
+  // Four seconds is still responsive while keeping the public feeds reliable.
+  const refreshTtlMs = force ? 4000 : CRYPTO_PRICE_TTL_MS;
+  const needs = wanted.filter(symbol => !cryptoRowIsCurrent(cryptoPriceCache[symbol]) || now - cryptoPriceCache[symbol].receivedAtMs > refreshTtlMs);
   if (needs.length) {
     const failed = [];
     await Promise.all(needs.map(async symbol => {
       try {
         let row;
         try { row = await fetchBinanceTicker(symbol, "api.binance.com"); }
-        catch (_) { row = await fetchBinanceTicker(symbol, "api.binance.us"); }
+        catch (_) { row = await fetchCoinbaseTicker(symbol); }
         cryptoPriceCache[symbol] = row;
       } catch (error) {
         failed.push(symbol);
@@ -176,7 +255,9 @@ async function getCryptoPrices(symbols, force = false) {
     }
   }
   const prices = {};
-  for (const symbol of wanted) if (cryptoPriceCache[symbol]) prices[symbol] = cryptoPriceCache[symbol];
+  for (const symbol of wanted) {
+    if (cryptoRowIsCurrent(cryptoPriceCache[symbol])) prices[symbol] = cryptoPriceCache[symbol];
+  }
   return { success: Object.keys(prices).length > 0, prices, updatedAt: Math.floor(Date.now() / 1000) };
 }
 
@@ -999,6 +1080,25 @@ app.get("/crypto/prices", async (req, res) => {
     .map(normalizeCryptoSymbol).filter(Boolean);
   const unique = [...new Set(symbols.length ? symbols : CRYPTO_SYMBOLS)];
   res.json(await getCryptoPrices(unique, req.query.fresh === "1" || req.query.fresh === "true"));
+});
+
+app.get("/crypto/debug", async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  const symbol = normalizeCryptoSymbol(req.query.symbol || "BTC");
+  if (!symbol) return res.status(400).json({ error: "Unsupported crypto symbol." });
+  const result = await getCryptoPrices([symbol], true);
+  const row = result.prices && result.prices[symbol];
+  res.json({
+    symbol,
+    price: row && row.price,
+    source: row && row.source,
+    providerTimestamp: row && row.lastUpdated,
+    receivedAtMs: row && row.receivedAtMs,
+    providerAgeSeconds: row && row.lastUpdated
+      ? Math.max(0, Math.floor(Date.now() / 1000) - Number(row.lastUpdated))
+      : null,
+    error: row ? null : "No current validated quote was returned."
+  });
 });
 
 app.get("/crypto/candles", async (req, res) => {
