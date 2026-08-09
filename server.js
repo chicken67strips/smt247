@@ -442,20 +442,74 @@ const CLOCK_START_MINUTE = clamp(
   0,
   MINUTES_PER_WEEK - 1
 );
-const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v5-auto-exact-handoff-2026-08-09";
+const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v6-yahoo-exact-handoff-2026-08-09";
 const FICTIONAL_TRADE_SECRET = String(process.env.FICTIONAL_MARKET_SECRET || "");
 const STATE_FILE = String(
   process.env.FICTIONAL_STATE_FILE ||
   (fs.existsSync("/data") ? "/data/fictional-market-state.json" : path.join(process.cwd(), "fictional-market-state.json"))
 );
-const REALISTIC_BACKEND_URL = String(
-  process.env.REALISTIC_BACKEND_URL ||
-  "https://roblox-stock-proxy-production.up.railway.app"
-).trim().replace(/\/+$/, "");
 const AUTO_HANDOFF_RETRY_MS = clamp(
   Number(process.env.FICTIONAL_HANDOFF_RETRY_MS) || 15000,
   5000,
   120000
+);
+
+const HANDOFF_REAL_TICKERS = {
+  ORNG: "AAPL",
+  MHRD: "MSFT",
+  MVDO: "NVDA",
+  AMZG: "AMZN",
+  ELPHT: "GOOGL",
+  DATA: "META",
+  NKLA: "TSLA",
+  SKYX: "SPCX",
+  BKSG: "BRK-B",
+  HCC: "AVGO",
+  ELLY: "LLY",
+  PMK: "JPM",
+  M: "V",
+  FMT: "WMT",
+  DVS: "UNH",
+  WXM: "XOM",
+  ABMD: "AMD",
+  NFKS: "NFLX",
+  BUM: "CRM",
+  DGBE: "ADBE",
+  REVL: "ORCL",
+  MNEY: "COST",
+  VKNEE: "DIS",
+  BEAR: "BA",
+  NICY: "NKE",
+  PPL: "PYPL",
+  INFO: "INTC",
+  OVER: "UBER",
+  WBAB: "ABNB",
+  SMNY: "SBUX",
+  BC: "KO",
+  RBLX: "RBLX",
+  CHHD: "SCHD",
+  VSS: "VOO",
+  MASK: "MASK",
+  MNTS: "MNTS",
+  DSY: "DSY",
+  ERNA: "ERNA",
+  CLDI: "CLDI",
+  AZI: "AZI",
+  DXST: "DXST",
+  WCT: "WCT",
+  AIXI: "AIXI",
+  CODX: "CODX",
+  GOVX: "GOVX",
+  CHAI: "CHAI",
+  CDLX: "CDLX",
+  DCX: "DCX",
+  CLPR: "CLPR"
+};
+
+const YAHOO_HANDOFF_CONCURRENCY = clamp(
+  Number(process.env.YAHOO_HANDOFF_CONCURRENCY) || 6,
+  1,
+  10
 );
 
 const FICTIONAL_INTERVALS = {
@@ -843,98 +897,125 @@ function missingRealHandoffTickers(rows) {
   });
 }
 
-async function fetchRealisticBackendJson(url, timeoutMs = 20000) {
-  const response = await fetchJson(
-    url,
-    {
-      headers: {
-        Accept: "application/json",
-        "User-Agent": "Godly-Capital-Exact-Handoff/2.0"
-      }
-    },
-    timeoutMs
-  );
+function yahooHandoffPriceFromChart(result) {
+  if (!result || typeof result !== "object") return null;
 
-  if (!response.ok || !response.data || typeof response.data !== "object") {
-    const message = response.data?.error || response.data?.message || response.data?.raw || `HTTP ${response.status}`;
-    throw new Error(String(message));
-  }
+  const meta = result.meta || {};
+  const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
+  const quote = result.indicators?.quote?.[0] || {};
+  const closes = Array.isArray(quote.close) ? quote.close : [];
 
-  return response.data;
-}
+  // Because includePrePost=true, the newest usable candle is the closest match
+  // to what the realistic game was displaying at the handoff instant.
+  let latestClose = null;
+  let latestTimestamp = 0;
 
-async function collectExactRealisticSnapshot() {
-  const rows = {};
-  const nonce = Date.now();
-
-  // First use the same bulk /prices endpoint the realistic Roblox game uses.
-  try {
-    const bulk = await fetchRealisticBackendJson(
-      `${REALISTIC_BACKEND_URL}/prices?fresh=1&handoff=${nonce}`,
-      30000
-    );
-
-    for (const ticker of requiredHandoffTickers()) {
-      const row = normalizeRealHandoffRow(bulk[ticker], "realistic backend /prices");
-      if (row) rows[ticker] = row;
+  for (let index = Math.min(timestamps.length, closes.length) - 1; index >= 0; index -= 1) {
+    const close = asNumber(closes[index]);
+    const ts = asNumber(timestamps[index]);
+    if (close > 0) {
+      latestClose = close;
+      latestTimestamp = ts || 0;
+      break;
     }
-  } catch (error) {
-    console.warn(`[FICTIONAL HANDOFF] Bulk realistic snapshot failed: ${error.message}`);
   }
 
-  // Resolve only missing symbols individually. This is deliberately concurrent
-  // so one slow symbol cannot hold Roblox's UI hostage.
-  let missing = missingRealHandoffTickers(rows);
-  if (missing.length) {
-    await Promise.all(missing.map(async ticker => {
-      try {
-        const data = await fetchRealisticBackendJson(
-          `${REALISTIC_BACKEND_URL}/price?ticker=${encodeURIComponent(ticker)}&fresh=1&handoff=${nonce}`,
-          20000
-        );
-        const row = normalizeRealHandoffRow(data, "realistic backend /price");
-        if (row) rows[ticker] = row;
-      } catch (_) {}
-    }));
-  }
+  const regularPrice = asNumber(meta.regularMarketPrice);
+  const price = latestClose > 0 ? latestClose : regularPrice;
+  if (!(price > 0)) return null;
 
-  // Final fallback: use the most recent REAL candle close. This is still a
-  // real-market value from the old backend, never a fictional seed.
-  missing = missingRealHandoffTickers(rows);
-  if (missing.length) {
-    await Promise.all(missing.map(async ticker => {
-      for (const interval of ["1m", "1d"]) {
-        try {
-          const data = await fetchRealisticBackendJson(
-            `${REALISTIC_BACKEND_URL}/candles?ticker=${encodeURIComponent(ticker)}&interval=${interval}&handoff=${nonce}`,
-            25000
-          );
-          if (!Array.isArray(data.candles)) continue;
-
-          for (let index = data.candles.length - 1; index >= 0; index -= 1) {
-            const candle = data.candles[index];
-            const close = asNumber(candle?.close ?? candle?.c);
-            if (!(close > 0)) continue;
-
-            rows[ticker] = {
-              price: close,
-              prevClose: close,
-              source: String(data.source || `realistic backend ${interval} candle`),
-              lastUpdated: asNumber(candle?.timestamp ?? candle?.ts ?? candle?.time) || 0
-            };
-            break;
-          }
-
-          if (rows[ticker]) break;
-        } catch (_) {}
-      }
-    }));
-  }
+  const prevClose =
+    asNumber(meta.previousClose) ||
+    asNumber(meta.chartPreviousClose) ||
+    price;
 
   return {
-    rows,
-    missing: missingRealHandoffTickers(rows)
+    price,
+    prevClose: prevClose > 0 ? prevClose : price,
+    source: "Yahoo Finance exact handoff",
+    lastUpdated: latestTimestamp || asNumber(meta.regularMarketTime) || 0
   };
+}
+
+async function fetchYahooHandoffTicker(displayTicker) {
+  const realTicker = HANDOFF_REAL_TICKERS[displayTicker];
+  if (!realTicker) {
+    throw new Error(`No real ticker mapping exists for ${displayTicker}.`);
+  }
+
+  let lastError = null;
+
+  for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
+    try {
+      const response = await fetchJson(
+        `https://${host}/v8/finance/chart/${encodeURIComponent(realTicker)}` +
+        `?range=5d&interval=1m&includePrePost=true&events=div%2Csplits&_=${Date.now()}`,
+        {
+          headers: {
+            Accept: "application/json",
+            "User-Agent": "Mozilla/5.0"
+          }
+        },
+        15000
+      );
+
+      const chart = response.data && response.data.chart;
+      const result = chart && Array.isArray(chart.result) && chart.result[0];
+
+      if (!response.ok || !result) {
+        throw new Error(
+          String(chart?.error?.description || chart?.error?.code || `Yahoo HTTP ${response.status}`)
+        );
+      }
+
+      const row = yahooHandoffPriceFromChart(result);
+      if (!row) throw new Error("Yahoo returned no usable price.");
+
+      return row;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error("Yahoo handoff request failed.");
+}
+
+async function collectExactYahooSnapshot() {
+  const required = requiredHandoffTickers();
+  const rows = {};
+  const failures = {};
+
+  let nextIndex = 0;
+
+  async function worker() {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= required.length) return;
+
+      const ticker = required[index];
+
+      try {
+        rows[ticker] = await fetchYahooHandoffTicker(ticker);
+      } catch (error) {
+        failures[ticker] = String(error?.message || error);
+      }
+    }
+  }
+
+  const workerCount = Math.min(YAHOO_HANDOFF_CONCURRENCY, required.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  const missing = missingRealHandoffTickers(rows);
+
+  if (missing.length) {
+    console.warn(
+      `[FICTIONAL HANDOFF] Yahoo exact snapshot missing ${missing.length}: ` +
+      missing.map(ticker => `${ticker}(${failures[ticker] || "no price"})`).join(", ")
+    );
+  }
+
+  return { rows, missing, failures };
 }
 
 async function attemptAutomaticExactHandoff() {
@@ -946,25 +1027,25 @@ async function attemptAutomaticExactHandoff() {
   automaticHandoffLastAttemptAt = Math.floor(Date.now() / 1000);
 
   try {
-    const snapshot = await collectExactRealisticSnapshot();
+    const snapshot = await collectExactYahooSnapshot();
     automaticHandoffMissingTickers = snapshot.missing;
 
     if (snapshot.missing.length > 0) {
       automaticHandoffLastError =
-        `Waiting for ${snapshot.missing.length} realistic ticker(s): ${snapshot.missing.join(", ")}`;
-      console.warn(`[FICTIONAL HANDOFF] ${automaticHandoffLastError}. Real Roblox prices remain active.`);
+        `Waiting for ${snapshot.missing.length} Yahoo handoff ticker(s): ${snapshot.missing.join(", ")}`;
+      console.warn(`[FICTIONAL HANDOFF] ${automaticHandoffLastError}. Fictional seed prices remain blocked.`);
       return false;
     }
 
     const vss = snapshot.rows.VSS && snapshot.rows.VSS.price;
     console.log(
-      `[FICTIONAL HANDOFF] Collected exact realistic snapshot ${requiredHandoffTickers().length}/${requiredHandoffTickers().length}. ` +
+      `[FICTIONAL HANDOFF] Collected exact Yahoo snapshot ${requiredHandoffTickers().length}/${requiredHandoffTickers().length}. ` +
       `VSS=$${Number(vss || 0).toFixed(4)}`
     );
 
     applyExactHandoffPrices(
       snapshot.rows,
-      "Automatic exact snapshot from realistic-game Railway"
+      "Automatic exact snapshot from Yahoo Finance using current-game ticker mapping"
     );
 
     automaticHandoffMissingTickers = [];
@@ -1551,7 +1632,7 @@ app.get("/health", (_req, res) => {
     automaticHandoffLastAttemptAt,
     automaticHandoffLastError,
     automaticHandoffMissingTickers,
-    realisticBackendUrl: REALISTIC_BACKEND_URL,
+    handoffProvider: "Yahoo Finance direct chart snapshot",
     handoffPriceCount: Number(marketState.handoffPriceCount) || 0,
     handoffSource: String(marketState.handoffSource || ""),
     handoffAt: Number(marketState.handoffAt) || 0,
@@ -1893,8 +1974,16 @@ app.post("/group-role/sync", async (req, res) => {
 async function startServer() {
   loadState();
 
+  if (marketState.handoffReady !== true) {
+    console.log("[FICTIONAL HANDOFF] Taking exact one-time Yahoo snapshot before opening the fictional market...");
+    await attemptAutomaticExactHandoff();
+  }
+
   setInterval(engineStep, 1000);
-  startAutomaticHandoffLoop();
+
+  if (marketState.handoffReady !== true) {
+    startAutomaticHandoffLoop();
+  }
 
   app.listen(PORT, () => {
     const clock = marketClock();
@@ -1904,7 +1993,7 @@ async function startServer() {
     if (marketState.handoffReady === true) {
       console.log(`[SERVER] Exact price handoff is READY for ${marketState.handoffPriceCount || 0} tickers.`);
     } else {
-      console.warn(`[SERVER] WAITING FOR EXACT PRICE HANDOFF. Roblox should remain on real prices while Railway snapshots all ${INITIAL_COMPANIES.length} tickers.`);
+      console.warn(`[SERVER] WAITING FOR EXACT YAHOO PRICE HANDOFF. Fictional seed prices remain blocked while Railway retries.`);
     }
   });
 }
