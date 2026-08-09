@@ -424,18 +424,30 @@ async function getCommodityCandles(ticker, requestedInterval) {
 }
 
 // ============================
-// Fictional stock exchange
+// Fictional stock exchange - MAIN GAME CATALOG
 // ============================
-const GAME_MS_PER_MINUTE = 5000;
+// Stock prices/candles/news are fully simulated and are not derived from real-stock feeds.
+// Crypto and commodities remain on their existing real-data code paths above.
 const MINUTES_PER_DAY = 1440;
 const MINUTES_PER_WEEK = 10080;
 const DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const REAL_SECONDS_PER_GAME_MINUTE = clamp(
+  Number(process.env.FICTIONAL_REAL_SECONDS_PER_GAME_MINUTE) || 30,
+  1,
+  60
+);
+const GAME_MS_PER_MINUTE = REAL_SECONDS_PER_GAME_MINUTE * 1000;
+const CLOCK_START_MINUTE = clamp(
+  Math.floor(Number(process.env.FICTIONAL_CLOCK_START_MINUTE) || 0),
+  0,
+  MINUTES_PER_WEEK - 1
+);
+const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v2-accelerated-2026-08-09";
 const FICTIONAL_TRADE_SECRET = String(process.env.FICTIONAL_MARKET_SECRET || "");
 const STATE_FILE = String(
   process.env.FICTIONAL_STATE_FILE ||
   (fs.existsSync("/data") ? "/data/fictional-market-state.json" : path.join(process.cwd(), "fictional-market-state.json"))
 );
-const CLOCK_START_MINUTE = clamp(Math.floor(Number(process.env.FICTIONAL_CLOCK_START_MINUTE) || 0), 0, MINUTES_PER_WEEK - 1);
 const FICTIONAL_INTERVALS = {
   "1m": { minutes: 1, limit: 540 },
   "5m": { minutes: 5, limit: 576 },
@@ -446,36 +458,55 @@ const FICTIONAL_INTERVALS = {
 };
 
 const INITIAL_COMPANIES = [
-  ["AURX", "Aurix Semiconductor", "Technology", "mega", 186.0, 122.40, 0.24, 0.43, 0.000, 0.82],
-  ["NBLT", "Northbolt Energy", "Energy", "mega", 128.0, 74.80, 0.08, 0.27, 0.031, 0.90],
-  ["VRTN", "Veriton Health", "Healthcare", "mega", 151.0, 96.30, 0.14, 0.25, 0.012, 0.88],
-  ["HBRM", "HarborMart Retail", "Consumer Defensive", "mega", 94.0, 58.25, 0.055, 0.16, 0.026, 0.94],
-  ["QNTA", "QuantaGrid Utilities", "Utilities", "mega", 112.0, 43.60, 0.045, 0.12, 0.043, 0.98],
-  ["STRL", "Starline Aerospace", "Industrials", "mega", 84.0, 88.10, 0.12, 0.31, 0.006, 0.83],
-  ["CDRM", "Cedar Mutual Banking", "Financials", "mega", 76.0, 51.90, 0.065, 0.18, 0.032, 0.95],
-  ["PLSE", "Pulse Social", "Communication Services", "mid", 35.0, 29.75, 0.19, 0.52, 0.000, 0.58],
-  ["FRGE", "ForgeWorks Industrial", "Industrials", "mid", 43.0, 67.35, 0.075, 0.24, 0.018, 0.83],
-  ["VYNE", "Veyne Pharma", "Healthcare", "mid", 27.0, 38.80, 0.15, 0.46, 0.000, 0.62],
-  ["BLNK", "BlueLink Logistics", "Industrials", "mid", 31.0, 46.20, 0.09, 0.25, 0.013, 0.78],
-  ["CRST", "Crestline Insurance", "Financials", "mid", 39.0, 72.15, 0.06, 0.17, 0.036, 0.93],
-  ["OMNI", "Omnitech Systems", "Technology", "mid", 52.0, 84.45, 0.17, 0.36, 0.004, 0.72],
-  ["GRVL", "Greenvale Foods", "Consumer Defensive", "mid", 24.0, 33.90, 0.04, 0.15, 0.039, 0.92],
-  ["RIVR", "Rivermark Beverages", "Consumer Defensive", "mid", 29.0, 55.10, 0.05, 0.18, 0.028, 0.90],
-  ["AXON", "Axonix Robotics", "Technology", "mid", 21.0, 41.25, 0.22, 0.55, 0.000, 0.55],
-  ["SUNV", "Sunvale Solar", "Energy", "mid", 18.0, 24.70, 0.13, 0.49, 0.000, 0.57],
-  ["MTRX", "Matrix Cloud", "Technology", "mid", 47.0, 91.60, 0.18, 0.38, 0.000, 0.68],
-  ["KNTC", "Kinetic Motors", "Consumer Cyclical", "mid", 33.0, 62.40, 0.07, 0.35, 0.009, 0.73],
-  ["ECHO", "Echo Entertainment", "Communication Services", "small", 8.2, 18.35, 0.03, 0.42, 0.000, 0.48],
-  ["SERA", "Sera Beauty", "Consumer Cyclical", "small", 6.7, 27.20, 0.11, 0.32, 0.000, 0.59],
-  ["TRNX", "Terranex Mining", "Materials", "small", 9.4, 14.85, -0.025, 0.47, 0.021, 0.52],
-  ["ALTO", "Alto Telecom", "Communication Services", "small", 12.0, 22.10, 0.025, 0.20, 0.052, 0.80],
-  ["BRCK", "Brickhouse Construction", "Industrials", "small", 7.5, 31.65, 0.06, 0.34, 0.015, 0.61],
-  ["NEON", "Neon Gaming", "Communication Services", "small", 5.3, 16.90, 0.21, 0.61, 0.000, 0.39],
-  ["WAVE", "Wavefront Media", "Communication Services", "small", 4.8, 12.75, -0.04, 0.51, 0.000, 0.43],
-  ["PRSM", "Prism Security", "Technology", "small", 11.0, 36.50, 0.16, 0.41, 0.000, 0.55],
-  ["GLDR", "Gilder Properties REIT", "Real Estate", "small", 13.0, 25.40, 0.035, 0.19, 0.064, 0.84],
-  ["BCRX", "Beacon BioScience", "Healthcare", "small", 3.4, 9.80, -0.13, 0.72, 0.000, 0.30],
-  ["NEXA", "Nexa Defense", "Industrials", "small", 14.0, 48.75, 0.10, 0.29, 0.012, 0.72]
+  ["ORNG", "Orange Inc.", "Technology", "mega", 310, 185.00, 0.1100, 0.2700, 0.0056, 0.96],
+  ["MHRD", "MacroHard Corporation", "Technology", "mega", 430, 418.00, 0.1000, 0.2500, 0.0087, 0.97],
+  ["MVDO", "Mvideo Corporation", "Technology", "mega", 280, 142.00, 0.1800, 0.4800, 0.0003, 0.91],
+  ["AMZG", "Amazing.com Inc.", "Consumer Cyclical", "mega", 250, 205.00, 0.1300, 0.3400, 0.0000, 0.94],
+  ["ELPHT", "Elephant Inc.", "Communication Services", "mega", 210, 172.00, 0.1200, 0.2900, 0.0049, 0.95],
+  ["DATA", "Data Platforms Inc.", "Communication Services", "mega", 185, 465.00, 0.1600, 0.3600, 0.0045, 0.92],
+  ["NKLA", "Nikola Inc.", "Consumer Cyclical", "mega", 115, 286.00, 0.1400, 0.5500, 0.0000, 0.86],
+  ["SKYX", "Sky Examination Corporation", "Industrials", "mega", 150, 112.00, 0.2000, 0.6000, 0.0000, 0.68],
+  ["BKSG", "Bookstore Getaways Inc.", "Financials", "mega", 275, 492.00, 0.0700, 0.1800, 0.0000, 0.98],
+  ["HCC", "HiCap Communications Inc.", "Technology", "mega", 165, 318.00, 0.1500, 0.3600, 0.0074, 0.91],
+  ["ELLY", "Elly and Company", "Healthcare", "mega", 145, 742.00, 0.1000, 0.3100, 0.0081, 0.93],
+  ["PMK", "PJMonroe Kevin and Company", "Financials", "mega", 190, 242.00, 0.0700, 0.2000, 0.0231, 0.97],
+  ["M", "Masters Inc.", "Financials", "mega", 155, 345.00, 0.0900, 0.2200, 0.0068, 0.96],
+  ["FMT", "Floor-Mart Inc.", "Consumer Defensive", "mega", 130, 104.00, 0.0600, 0.1600, 0.0090, 0.98],
+  ["DVS", "DividedShield Group Inc.", "Healthcare", "mega", 155, 355.00, 0.0700, 0.2500, 0.0249, 0.94],
+  ["WXM", "Mobile Waxbar Corporation", "Energy", "mega", 125, 118.00, 0.0450, 0.2400, 0.0336, 0.95],
+  ["ABMD", "Abnormally Massive Devices, Inc.", "Technology", "mid", 82, 158.00, 0.1700, 0.4500, 0.0000, 0.87],
+  ["NFKS", "NutFlakes Inc.", "Communication Services", "mid", 76, 920.00, 0.1400, 0.4100, 0.0000, 0.86],
+  ["BUM", "Buyers Union Inc.", "Technology", "mid", 68, 272.00, 0.1200, 0.3100, 0.0000, 0.84],
+  ["DGBE", "Digobe Inc.", "Technology", "mid", 62, 405.00, 0.1000, 0.3000, 0.0000, 0.83],
+  ["REVL", "Revelation Corporation", "Technology", "mid", 70, 182.00, 0.0900, 0.2800, 0.0110, 0.88],
+  ["MNEY", "MoneyWise Wholesale Corporation", "Consumer Defensive", "mid", 79, 905.00, 0.0800, 0.2000, 0.0057, 0.92],
+  ["VKNEE", "The Vaulted Knee Company", "Communication Services", "mid", 54, 116.00, 0.0400, 0.3100, 0.0172, 0.84],
+  ["BEAR", "The Bearing Company", "Industrials", "mid", 58, 224.00, 0.0600, 0.3500, 0.0000, 0.82],
+  ["NICY", "Nicely Inc.", "Consumer Cyclical", "mid", 48, 78.00, 0.0500, 0.3000, 0.0205, 0.85],
+  ["PPL", "Peoples Holdings Inc", "Financials", "mid", 44, 73.00, 0.0800, 0.3600, 0.0000, 0.83],
+  ["INFO", "Informed Corporation", "Technology", "mid", 46, 29.00, 0.0300, 0.4200, 0.0000, 0.89],
+  ["OVER", "Over Technologies Inc.", "Technology", "mid", 52, 91.00, 0.1500, 0.4000, 0.0000, 0.82],
+  ["WBAB", "Water Bread and Breakfast Inc.", "Consumer Cyclical", "mid", 39, 148.00, 0.0900, 0.3800, 0.0000, 0.74],
+  ["SMNY", "SpaceMoney Corporation", "Consumer Cyclical", "mid", 37, 94.00, 0.0600, 0.3000, 0.0260, 0.81],
+  ["BC", "The Bloxy-Cola Company", "Consumer Defensive", "mega", 105, 71.00, 0.0450, 0.1400, 0.0287, 0.98],
+  ["RBLX", "Roblox Corporation", "Communication Services", "mid", 38, 72.00, 0.1200, 0.5100, 0.0000, 0.76],
+  ["CHHD", "Chuck U.S. High Dividend ETF", "ETF", "mega", 92, 29.00, 0.0550, 0.1300, 0.0359, 0.99],
+  ["VSS", "VehicleShield S&P 500 ETF", "ETF", "mega", 510, 615.00, 0.0800, 0.1400, 0.0117, 0.99],
+  ["MASK", "MaskTech Industries", "Technology", "small", 7.2, 21.50, 0.1400, 0.5200, 0.0000, 0.52],
+  ["MNTS", "Mantis Robotics", "Technology", "small", 4.8, 13.80, 0.2000, 0.6400, 0.0000, 0.43],
+  ["DSY", "Daisy Systems", "Technology", "small", 6.5, 28.40, 0.1100, 0.4800, 0.0000, 0.55],
+  ["ERNA", "Extraordinary Biotechnologies Inc.", "Healthcare", "small", 3.2, 8.60, -0.0500, 0.7200, 0.0000, 0.31],
+  ["CLDI", "Cloudi Networks", "Technology", "small", 8.4, 34.75, 0.1600, 0.5100, 0.0000, 0.58],
+  ["AZI", "Azimuth Dynamics", "Industrials", "small", 5.9, 17.20, 0.0800, 0.4500, 0.0000, 0.57],
+  ["DXST", "Dexstar Technologies", "Technology", "small", 7.6, 26.80, 0.1300, 0.5400, 0.0000, 0.53],
+  ["WCT", "WeConnect Telecom", "Communication Services", "small", 4.7, 11.90, 0.0400, 0.3700, 0.0000, 0.60],
+  ["AIXI", "AIXI Labs", "Technology", "small", 5.5, 19.40, 0.2200, 0.6800, 0.0000, 0.39],
+  ["CODX", "CodeX Software", "Technology", "small", 6.1, 24.10, 0.1800, 0.5800, 0.0000, 0.48],
+  ["GOVX", "GovX Defense", "Industrials", "small", 9.2, 31.50, 0.1000, 0.3900, 0.0000, 0.66],
+  ["CHAI", "Chai Beverage Group", "Consumer Defensive", "small", 4.3, 15.70, 0.0600, 0.3300, 0.0000, 0.64],
+  ["CDLX", "Cradle Holdings", "Financials", "small", 5.0, 18.90, 0.0700, 0.4100, 0.0000, 0.61],
+  ["DCX", "DCX Logistics", "Industrials", "small", 6.8, 23.60, 0.0800, 0.4300, 0.0000, 0.63],
+  ["CLPR", "Caliper Energy", "Energy", "small", 5.7, 16.30, 0.0500, 0.4900, 0.0000, 0.55]
 ];
 
 const IPO_NAME_PARTS = {
@@ -492,10 +523,12 @@ let saveTimer = null;
 let lastPeriodicSaveAt = Date.now();
 
 function sessionForMinute(totalMinute) {
-  const dayIndex = Math.floor(totalMinute / MINUTES_PER_DAY);
-  const weekdayIndex = ((dayIndex % 7) + 7) % 7;
-  const minuteOfDay = ((totalMinute % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
-  if (weekdayIndex >= 5) return "closed";
+  const safeMinute = Math.max(0, Math.floor(Number(totalMinute) || 0));
+  const dayIndex = Math.floor(safeMinute / MINUTES_PER_DAY);
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay = ((safeMinute % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+
+  if (dayOfWeekIndex >= 5) return "closed";
   if (minuteOfDay >= 240 && minuteOfDay < 570) return "pre-market";
   if (minuteOfDay >= 570 && minuteOfDay < 960) return "open";
   if (minuteOfDay >= 960 && minuteOfDay < 1200) return "after-hours";
@@ -513,28 +546,54 @@ function nextSessionText(dayOfWeekIndex, minuteOfDay, session) {
 }
 
 function marketClock(nowMs = Date.now()) {
-  const anchor = Number(marketState?.clockAnchorRealMs) || nowMs;
-  const elapsedGameSeconds = Math.max(0, (nowMs - anchor) * 60 / GAME_MS_PER_MINUTE);
-  const totalMinutes = Math.floor(elapsedGameSeconds / 60);
-  const gameSecond = Math.floor(elapsedGameSeconds % 60);
+  const anchorRealMs = Number(marketState?.clockAnchorRealMs) || nowMs;
+  const anchorGameSeconds = Number.isFinite(Number(marketState?.clockAnchorGameSeconds))
+    ? Number(marketState.clockAnchorGameSeconds)
+    : CLOCK_START_MINUTE * 60;
+
+  const elapsedRealMs = Math.max(0, nowMs - anchorRealMs);
+  const elapsedGameSeconds = elapsedRealMs * 60 / GAME_MS_PER_MINUTE;
+  const totalGameSeconds = Math.max(0, Math.floor(anchorGameSeconds + elapsedGameSeconds));
+  const totalMinutes = Math.floor(totalGameSeconds / 60);
+  const gameSecond = totalGameSeconds % 60;
   const dayIndex = Math.floor(totalMinutes / MINUTES_PER_DAY);
-  const minuteOfDay = totalMinutes % MINUTES_PER_DAY;
-  const dayOfWeekIndex = dayIndex % 7;
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay = ((totalMinutes % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
   const hour = Math.floor(minuteOfDay / 60);
   const minute = minuteOfDay % 60;
   const session = sessionForMinute(totalMinutes);
   const displayHour = ((hour + 11) % 12) + 1;
   const exactTime = `${displayHour}:${String(minute).padStart(2, "0")}:${String(gameSecond).padStart(2, "0")} ${hour >= 12 ? "PM" : "AM"}`;
+
   return {
-    totalMinutes, gameSecond, dayIndex, dayOfWeekIndex,
+    totalGameSeconds,
+    totalMinutes,
+    gameSecond,
+    dayIndex,
+    dayOfWeekIndex,
     dayName: DAY_NAMES[dayOfWeekIndex],
     week: Math.floor(dayIndex / 7) + 1,
-    minuteOfDay, hour, minute, exactTime, session,
-    label: session === "open" ? "MARKET OPEN" : session === "pre-market" ? "PRE-MARKET" : session === "after-hours" ? "AFTER HOURS" : "MARKET CLOSED",
+    minuteOfDay,
+    hour,
+    minute,
+    exactTime,
+    session,
+    label: session === "open"
+      ? "MARKET OPEN"
+      : session === "pre-market"
+        ? "PRE-MARKET"
+        : session === "after-hours"
+          ? "AFTER HOURS"
+          : "MARKET CLOSED",
     isWeekday: dayOfWeekIndex < 5,
     isOpen: session !== "closed",
     isRegularHours: session === "open",
     isTradingAllowed: session !== "closed",
+    isHoliday: false,
+    holidayName: "",
+    earlyClose: false,
+    earlyCloseName: "",
+    regularCloseMinute: 960,
     nextEventText: nextSessionText(dayOfWeekIndex, minuteOfDay, session)
   };
 }
@@ -563,38 +622,73 @@ function companyFromSeed(seed, listedGameMinute = 0) {
 }
 
 function initialNews(companies) {
+  const clock = marketClock();
   const events = [
-    ["AURX", "Aurix Semiconductor opens the week with strong chip demand", "Sector outlook", "positive", "Demand supports a high-growth outlook, but the shares remain volatile."],
-    ["QNTA", "QuantaGrid Utilities confirms its quarterly dividend policy", "Dividend update", "positive", "The low-volatility utility continues to prioritize stable cash returns."],
-    ["BCRX", "Beacon BioScience warns that its next trial milestone carries execution risk", "Clinical risk", "negative", "The loss-making biotech may react sharply to future research updates."],
-    ["NBLT", "Northbolt Energy begins a new capacity expansion program", "Capital investment", "neutral", "The investment may lift long-term value while increasing near-term spending."],
-    ["GLDR", "Gilder Properties REIT reports steady tenant collections", "Operating update", "positive", "Stable collections support the company's higher dividend profile."],
-    ["NEON", "Neon Gaming prepares a major product launch", "Product pipeline", "neutral", "The small-cap company has high upside potential and high event risk."]
+    ["ORNG", "Orange Inc. starts the session with steady device demand", "Operating update", "positive", "Management sees healthy demand while continuing to invest in future products."],
+    ["MVDO", "Mvideo Corporation expands its next-generation computing roadmap", "Product roadmap", "positive", "Investors are weighing high growth potential against elevated volatility."],
+    ["PMK", "PJMonroe Kevin and Company reports stable credit conditions", "Banking update", "neutral", "Credit quality remains stable and the company continues to prioritize disciplined growth."],
+    ["CHHD", "Chuck U.S. High Dividend ETF enters the session with a defensive income tilt", "ETF update", "neutral", "The fund remains focused on mature dividend-paying companies."],
+    ["ERNA", "Extraordinary Biotechnologies highlights execution risk around its research pipeline", "Clinical risk", "negative", "The small-cap biotech may react sharply to future research results."],
+    ["GOVX", "GovX Defense announces a new long-term development program", "Contract pipeline", "positive", "The program could support future revenue if execution remains on schedule."]
   ];
-  return events.map(([ticker, headline, eventType, sentiment, summary]) => ({
-    id: crypto.randomUUID(), ticker, displayTicker: ticker,
-    assetType: "fictional-stock", fictional: true,
-    companyName: companies[ticker].name, sector: companies[ticker].sector,
-    headline, summary, eventType, eventText: "Opening company brief",
-    expectedResult: "Player order flow and later company events will determine the traded price.",
-    sentiment, impactPct: 0, gameDayName: "Monday", gameTime: "12:00:00 AM",
-    publishedAtGameMinute: 0, publishedAt: Math.floor(Date.now() / 1000), url: ""
-  }));
+  return events
+    .filter(([ticker]) => companies[ticker])
+    .map(([ticker, headline, eventType, sentiment, summary]) => ({
+      id: crypto.randomUUID(),
+      ticker,
+      displayTicker: ticker,
+      assetType: "fictional-stock",
+      fictional: true,
+      companyName: companies[ticker].name,
+      sector: companies[ticker].sector,
+      headline,
+      summary,
+      eventType,
+      eventText: "Opening company brief",
+      expectedResult: "Company fundamentals, simulated market movement, and player order flow can move the stock price.",
+      sentiment,
+      impactPct: 0,
+      gameDayName: clock.dayName,
+      gameTime: clock.exactTime,
+      publishedAtGameMinute: clock.totalMinutes,
+      publishedAt: Math.floor(Date.now() / 1000),
+      url: ""
+    }));
 }
 
 function newMarketState() {
   const companies = {};
-  for (const seed of INITIAL_COMPANIES) companies[seed[0]] = companyFromSeed(seed, 0);
-  return {
-    version: 3,
-    clockAnchorRealMs: Date.now() - CLOCK_START_MINUTE * GAME_MS_PER_MINUTE,
+  for (const seed of INITIAL_COMPANIES) {
+    const company = companyFromSeed(seed, CLOCK_START_MINUTE);
+    // These are the exchange's established starting listings, not fresh IPOs.
+    company.ipoWeek = 0;
+    company.ipoActiveUntil = 0;
+    companies[seed[0]] = company;
+  }
+
+  const state = {
+    version: 5,
+    catalogVersion: FICTIONAL_CATALOG_VERSION,
+    clockMode: "accelerated-fictional-week",
+    clockAnchorRealMs: Date.now(),
+    clockAnchorGameSeconds: CLOCK_START_MINUTE * 60,
+    realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
     lastUpdatedGameMinute: CLOCK_START_MINUTE,
-    lastIpoWeek: Math.floor(CLOCK_START_MINUTE / MINUTES_PER_WEEK) + 1,
+    lastIpoWeek: 0,
     nextNewsGameMinute: CLOCK_START_MINUTE + 120,
     companies,
-    news: initialNews(companies),
+    news: [],
     tradeReceipts: {}
   };
+
+  // marketClock() reads marketState, so temporarily expose this fresh state while
+  // creating the opening news timestamps.
+  const priorState = marketState;
+  marketState = state;
+  state.news = initialNews(companies);
+  marketState = priorState;
+
+  return state;
 }
 
 function saveStateNow() {
@@ -620,15 +714,56 @@ function queueSave(delayMs = 1000) {
 function loadState() {
   try {
     const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    if (!parsed?.companies || !parsed.clockAnchorRealMs) throw new Error("state is missing required fields");
+    if (!parsed?.companies) throw new Error("state is missing required fields");
+    if (parsed.catalogVersion !== FICTIONAL_CATALOG_VERSION) {
+      throw new Error(`catalog changed (${parsed.catalogVersion || "legacy"} -> ${FICTIONAL_CATALOG_VERSION})`);
+    }
+
+    for (const seed of INITIAL_COMPANIES) {
+      if (!parsed.companies[seed[0]]) {
+        throw new Error(`state is missing current ticker ${seed[0]}`);
+      }
+    }
+
     marketState = parsed;
     marketState.news = Array.isArray(marketState.news) ? marketState.news : [];
     marketState.tradeReceipts = marketState.tradeReceipts || {};
-    console.log(`[FICTIONAL] Loaded ${Object.keys(marketState.companies).length} companies from persistent state.`);
+    marketState.catalogVersion = FICTIONAL_CATALOG_VERSION;
+    marketState.clockMode = "accelerated-fictional-week";
+
+    if (!Number.isFinite(Number(marketState.clockAnchorRealMs))) {
+      marketState.clockAnchorRealMs = Date.now();
+    }
+    if (!Number.isFinite(Number(marketState.clockAnchorGameSeconds))) {
+      marketState.clockAnchorGameSeconds = CLOCK_START_MINUTE * 60;
+    }
+
+    const priorSpeed = Number(marketState.realSecondsPerGameMinute);
+    if (Number.isFinite(priorSpeed) && priorSpeed > 0 && Math.abs(priorSpeed - REAL_SECONDS_PER_GAME_MINUTE) > 1e-9) {
+      // Preserve the current fictional time if the speed is changed later.
+      const nowMs = Date.now();
+      const elapsedRealMs = Math.max(0, nowMs - Number(marketState.clockAnchorRealMs));
+      marketState.clockAnchorGameSeconds = Math.max(
+        0,
+        Math.floor(Number(marketState.clockAnchorGameSeconds) + elapsedRealMs * 60 / (priorSpeed * 1000))
+      );
+      marketState.clockAnchorRealMs = nowMs;
+    }
+    marketState.realSecondsPerGameMinute = REAL_SECONDS_PER_GAME_MINUTE;
+
+    const clock = marketClock();
+    if (!Number.isFinite(Number(marketState.lastUpdatedGameMinute))) {
+      marketState.lastUpdatedGameMinute = clock.totalMinutes;
+    }
+    if (!Number.isFinite(Number(marketState.nextNewsGameMinute)) || Number(marketState.nextNewsGameMinute) < clock.totalMinutes - 1440) {
+      marketState.nextNewsGameMinute = clock.totalMinutes + 120;
+    }
+
+    console.log(`[FICTIONAL] Loaded ${Object.keys(marketState.companies).length} main-game companies from persistent state.`);
   } catch (error) {
     marketState = newMarketState();
     saveStateNow();
-    console.log(`[FICTIONAL] Started a new dedicated 30-company market (${error.code || error.message}).`);
+    console.log(`[FICTIONAL] Started a new ${INITIAL_COMPANIES.length}-company main-game market (${error.code || error.message}).`);
   }
 }
 
@@ -678,19 +813,30 @@ function companyRow(company, clock = marketClock()) {
 }
 
 function candleRecord(bucketMinute, open, high, low, close, volume, session) {
-  const dayIndex = Math.floor(bucketMinute / MINUTES_PER_DAY);
-  const minuteOfDay = ((bucketMinute % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+  const safeBucket = Math.max(0, Math.floor(Number(bucketMinute) || 0));
+  const dayIndex = Math.floor(safeBucket / MINUTES_PER_DAY);
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay = ((safeBucket % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+  const hour = Math.floor(minuteOfDay / 60);
+  const minute = minuteOfDay % 60;
   const o = round(open, 4);
   const h = round(Math.max(high, open, close, low), 4);
   const l = round(Math.max(0.01, Math.min(low, open, close, high)), 4);
   const c = round(close, 4);
   const v = Math.max(1, Math.round(volume));
+
   return {
-    t: bucketMinute * 60, ts: bucketMinute * 60, time: bucketMinute * 60, timestamp: bucketMinute * 60,
-    datetime: `${DAY_NAMES[((dayIndex % 7) + 7) % 7]} ${String(Math.floor(minuteOfDay / 60)).padStart(2, "0")}:${String(minuteOfDay % 60).padStart(2, "0")}`,
-    o, h, l, c, v, open: o, high: h, low: l, close: c, volume: v, session,
+    t: safeBucket * 60,
+    ts: safeBucket * 60,
+    time: safeBucket * 60,
+    timestamp: safeBucket * 60,
+    bucketMinute: safeBucket,
+    datetime: `${DAY_NAMES[dayOfWeekIndex]} ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+    o, h, l, c, v,
+    open: o, high: h, low: l, close: c, volume: v,
+    session,
     gameDayIndex: dayIndex,
-    gameDayName: DAY_NAMES[((dayIndex % 7) + 7) % 7],
+    gameDayName: DAY_NAMES[dayOfWeekIndex],
     gameMinuteOfDay: minuteOfDay
   };
 }
@@ -706,7 +852,13 @@ function ensureCandleSeries(company, intervalKey) {
   let safety = 0;
   while (buckets.length < 220 && safety < 50000) {
     const session = sessionForMinute(cursor);
-    if (intervalKey === "1d" || session !== "closed") buckets.push(cursor);
+    if (intervalKey === "1d") {
+      const dayIndex = Math.floor(cursor / MINUTES_PER_DAY);
+      const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+      if (dayOfWeekIndex < 5) buckets.push(cursor);
+    } else if (session !== "closed") {
+      buckets.push(cursor);
+    }
     cursor -= spec.minutes;
     safety += 1;
   }
@@ -739,7 +891,7 @@ function updateCandles(company, priorPrice, price, clock, playerVolume = 0) {
     const series = ensureCandleSeries(company, intervalKey);
     const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
     const current = series[series.length - 1];
-    const currentBucket = current ? current.gameDayIndex * MINUTES_PER_DAY + current.gameMinuteOfDay : null;
+    const currentBucket = current ? Number(current.bucketMinute) : null;
     const volume = Math.max(1, Math.round((120 + Math.random() * 900) * spec.minutes * company.liquidity + playerVolume));
     if (!current || currentBucket !== bucket) {
       series.push(candleRecord(bucket, priorPrice, Math.max(priorPrice, price), Math.min(priorPrice, price), price, volume, clock.session));
@@ -813,7 +965,7 @@ function generateCompanyNews(clock) {
   };
   marketState.news.unshift(article);
   marketState.news = marketState.news.slice(0, 300);
-  marketState.nextNewsGameMinute = clock.totalMinutes + 90 + Math.floor(Math.random() * 151);
+  marketState.nextNewsGameMinute = clock.totalMinutes + 8 + Math.floor(Math.random() * 18);
   console.log(`[FICTIONAL NEWS] ${article.headline} (${article.impactPct}%)`);
   queueSave();
 }
@@ -877,18 +1029,32 @@ function createWeeklyIpo(week, clock) {
 function engineStep() {
   if (!marketState) return;
   const clock = marketClock();
-  const elapsedGameMinutes = clamp(clock.totalMinutes - Number(marketState.lastUpdatedGameMinute || 0), 0, MINUTES_PER_DAY);
+  const elapsedGameMinutes = clamp(clock.totalMinutes - Number(marketState.lastUpdatedGameMinute || clock.totalMinutes), 0, MINUTES_PER_DAY);
+
   if (elapsedGameMinutes > 0) {
-    for (const company of Object.values(marketState.companies)) updateCompany(company, elapsedGameMinutes, clock);
+    for (const company of Object.values(marketState.companies)) {
+      updateCompany(company, elapsedGameMinutes, clock);
+    }
     marketState.lastUpdatedGameMinute = clock.totalMinutes;
   }
-  if (clock.totalMinutes >= Number(marketState.nextNewsGameMinute || 0)) generateCompanyNews(clock);
-  const reachedListingWindow = clock.dayOfWeekIndex < 5 && (clock.dayOfWeekIndex > 0 || clock.minuteOfDay >= 570);
-  if (clock.week > Number(marketState.lastIpoWeek || 1) && reachedListingWindow) createWeeklyIpo(clock.week, clock);
-  if (clock.minuteOfDay === 960 && clock.dayOfWeekIndex < 5 && Number(marketState.lastCloseDayIndex) !== clock.dayIndex) {
-    for (const company of Object.values(marketState.companies)) company.prevClose = company.price;
-    marketState.lastCloseDayIndex = clock.dayIndex;
+
+  if (clock.totalMinutes >= Number(marketState.nextNewsGameMinute || 0)) {
+    generateCompanyNews(clock);
   }
+
+  // The main Roblox game already owns GCFC/player-company IPO logic.
+  // Do not inject random new exchange tickers here.
+  marketState.lastIpoWeek = 0;
+
+  // Snapshot regular-session close once per Eastern trading day.
+  if (clock.minuteOfDay >= 960 && clock.dayOfWeekIndex < 5 && Number(marketState.lastCloseDayIndex) !== clock.dayIndex) {
+    for (const company of Object.values(marketState.companies)) {
+      company.prevClose = company.price;
+    }
+    marketState.lastCloseDayIndex = clock.dayIndex;
+    queueSave();
+  }
+
   if (Date.now() - lastPeriodicSaveAt >= 30000) {
     lastPeriodicSaveAt = Date.now();
     queueSave();
@@ -1059,13 +1225,18 @@ app.get("/health", (_req, res) => {
   const clock = marketClock();
   res.json({
     status: "ok",
-    backend: "dedicated-fictional-exchange",
+    backend: "main-game-fictional-exchange",
     companyCount: Object.keys(marketState.companies).length,
     gameWeek: clock.week,
     gameDay: clock.dayName,
     gameTime: clock.exactTime,
     session: clock.session,
     persistentStateFile: STATE_FILE,
+    catalogVersion: FICTIONAL_CATALOG_VERSION,
+    clockMode: "accelerated-fictional-week",
+    realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
+    realSecondsPerGameDay: REAL_SECONDS_PER_GAME_MINUTE * MINUTES_PER_DAY,
+    automaticIposEnabled: false,
     fictionalTradeSecretConfigured: Boolean(FICTIONAL_TRADE_SECRET),
     groupSyncConfigured: Boolean(GROUP_SYNC_SECRET && ROBLOX_OPEN_CLOUD_API_KEY),
     cryptoCached: Object.keys(cryptoPriceCache).length,
@@ -1141,10 +1312,12 @@ app.get("/fictional/market/status", (_req, res) => {
     second: clock.gameSecond,
     timeText: `${clock.dayName} | ${clock.exactTime} ET`,
     holidaysIgnored: true,
-    realSecondsPerGameMinute: GAME_MS_PER_MINUTE / 1000,
-    realSecondsPerGameDay: 7200,
+    realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
+    realSecondsPerGameDay: REAL_SECONDS_PER_GAME_MINUTE * MINUTES_PER_DAY,
+    clockMode: "accelerated-fictional-week",
     companyCount: Object.keys(marketState.companies).length,
-    lastIpoWeek: marketState.lastIpoWeek,
+    lastIpoWeek: 0,
+    automaticIposEnabled: false,
     nextNewsGameMinute: marketState.nextNewsGameMinute
   });
 });
@@ -1199,13 +1372,50 @@ app.get("/fictional/news", (req, res) => {
   res.json({ success: true, fictional: true, ticker, articles: marketState.news.filter(article => article.ticker === ticker).slice(0, 60) });
 });
 
+app.get("/fictional/news/watchlist", (req, res) => {
+  engineStep();
+  const rawAssets = String(req.query.assets || "");
+  const requested = rawAssets.split(",").map(item => item.trim()).filter(Boolean).slice(0, 50);
+  const items = [];
+
+  for (const raw of requested) {
+    const splitAt = raw.indexOf(":");
+    const requestedType = splitAt >= 0 ? raw.slice(0, splitAt).toLowerCase() : "stock";
+    const ticker = normalizeFictionalTicker(splitAt >= 0 ? raw.slice(splitAt + 1) : raw);
+
+    if (requestedType === "stock" && marketState.companies[ticker]) {
+      const article = marketState.news.find(item => item.ticker === ticker) || null;
+      items.push({
+        ticker,
+        assetType: "stock",
+        success: true,
+        latestStrongNews: article,
+        article
+      });
+    } else {
+      // This endpoint is specifically for simulated-stock news. Crypto/commodity
+      // watchlist rows can remain present without accidentally requesting real-stock news.
+      items.push({
+        ticker,
+        assetType: requestedType,
+        success: true,
+        latestStrongNews: null,
+        article: null
+      });
+    }
+  }
+
+  res.json({ success: true, fictional: true, items, fetchedAt: Math.floor(Date.now() / 1000) });
+});
+
 app.get("/fictional/ipo/current", (_req, res) => {
   engineStep();
-  const clock = marketClock();
-  const company = Object.values(marketState.companies)
-    .filter(item => Number(item.ipoWeek) === Number(marketState.lastIpoWeek))
-    .sort((a, b) => Number(b.listedGameMinute) - Number(a.listedGameMinute))[0];
-  res.json({ success: true, week: clock.week, ipo: company ? companyRow(company, clock) : null });
+  res.json({
+    success: true,
+    automaticIposEnabled: false,
+    ipo: null,
+    message: "Backend-generated IPOs are disabled; the Roblox game owns GCFC and player-company IPOs."
+  });
 });
 
 app.post("/fictional/trade", (req, res) => {
@@ -1299,6 +1509,6 @@ loadState();
 setInterval(engineStep, 1000);
 
 app.listen(PORT, () => {
-  console.log(`[SERVER] Dedicated fictional exchange ready on port ${PORT}.`);
-  console.log(`[SERVER] ${Object.keys(marketState.companies).length} fictional stocks; real crypto and commodities enabled.`);
+  console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
+  console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; real crypto and commodities enabled.`);
 });
