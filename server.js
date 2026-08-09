@@ -442,7 +442,7 @@ const CLOCK_START_MINUTE = clamp(
   0,
   MINUTES_PER_WEEK - 1
 );
-const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v6-yahoo-exact-handoff-2026-08-09";
+const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v7-yahoo-handoff-nil-fix-2026-08-09";
 const FICTIONAL_TRADE_SECRET = String(process.env.FICTIONAL_MARKET_SECRET || "");
 const STATE_FILE = String(
   process.env.FICTIONAL_STATE_FILE ||
@@ -853,7 +853,7 @@ function applyExactHandoffPrices(inputRows, source = "Roblox realistic-market ha
   marketState.clockAnchorGameSeconds = CLOCK_START_MINUTE * 60;
   marketState.lastUpdatedGameMinute = CLOCK_START_MINUTE;
   marketState.nextNewsGameMinute = CLOCK_START_MINUTE + 120;
-  marketState.lastCloseDayIndex = nil;
+  marketState.lastCloseDayIndex = null;
 
   marketState.handoffReady = true;
   marketState.handoffPriceCount = prepared.length;
