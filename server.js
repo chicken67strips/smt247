@@ -438,16 +438,21 @@ const REAL_SECONDS_PER_GAME_MINUTE = clamp(
 );
 const GAME_MS_PER_MINUTE = REAL_SECONDS_PER_GAME_MINUTE * 1000;
 const CLOCK_START_MINUTE = clamp(
-  Math.floor(Number(process.env.FICTIONAL_CLOCK_START_MINUTE) || 0),
+  Math.floor(Number(process.env.FICTIONAL_CLOCK_START_MINUTE) || 570),
   0,
   MINUTES_PER_WEEK - 1
 );
-const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v2-accelerated-2026-08-09";
+const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v3-real-price-handoff-2026-08-09";
 const FICTIONAL_TRADE_SECRET = String(process.env.FICTIONAL_MARKET_SECRET || "");
 const STATE_FILE = String(
   process.env.FICTIONAL_STATE_FILE ||
   (fs.existsSync("/data") ? "/data/fictional-market-state.json" : path.join(process.cwd(), "fictional-market-state.json"))
 );
+const REAL_PRICE_BOOTSTRAP_URL = String(
+  process.env.REAL_PRICE_BOOTSTRAP_URL ||
+  "https://roblox-stock-proxy-production.up.railway.app/prices?fresh=1"
+).trim();
+
 const FICTIONAL_INTERVALS = {
   "1m": { minutes: 1, limit: 540 },
   "5m": { minutes: 5, limit: 576 },
@@ -678,7 +683,10 @@ function newMarketState() {
     nextNewsGameMinute: CLOCK_START_MINUTE + 120,
     companies,
     news: [],
-    tradeReceipts: {}
+    tradeReceipts: {},
+    realPriceBootstrapped: false,
+    realPriceBootstrapCount: 0,
+    realPriceBootstrapSource: ""
   };
 
   // marketClock() reads marketState, so temporarily expose this fresh state while
@@ -689,6 +697,86 @@ function newMarketState() {
   marketState = priorState;
 
   return state;
+}
+
+
+async function bootstrapFreshStateFromRealPrices() {
+  if (!marketState || !REAL_PRICE_BOOTSTRAP_URL) return 0;
+
+  let rows = null;
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const separator = REAL_PRICE_BOOTSTRAP_URL.includes("?") ? "&" : "?";
+      const url = `${REAL_PRICE_BOOTSTRAP_URL}${separator}_handoff=${Date.now()}`;
+      const response = await fetchJson(
+        url,
+        { headers: { Accept: "application/json", "User-Agent": "Godly-Capital-Fictional-Handoff/1.0" } },
+        20000
+      );
+
+      if (!response.ok || !response.data || typeof response.data !== "object" || Array.isArray(response.data)) {
+        throw new Error(`real-price bootstrap HTTP ${response.status}`);
+      }
+
+      rows = response.data;
+      break;
+    } catch (error) {
+      lastError = error;
+      console.warn(`[FICTIONAL HANDOFF] Real-price bootstrap attempt ${attempt} failed: ${error.message}`);
+      if (attempt < 2) {
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    }
+  }
+
+  if (!rows) {
+    console.warn(
+      `[FICTIONAL HANDOFF] Could not snapshot the realistic-game prices. ` +
+      `Using configured fallback prices instead. ${lastError ? lastError.message : ""}`
+    );
+    return 0;
+  }
+
+  let updated = 0;
+
+  for (const company of Object.values(marketState.companies)) {
+    const row = rows[company.ticker];
+    const livePrice = row && asNumber(row.price);
+
+    if (!(livePrice > 0)) continue;
+
+    // Preserve company scale/fundamentals while making fair value equal the exact
+    // real-game handoff price. This prevents the fair-value pull from dragging a
+    // newly handed-off stock back toward the old hard-coded seed price.
+    company.price = livePrice;
+    company.prevClose = livePrice;
+    company.initialPrice = livePrice;
+    company.ipoPrice = livePrice;
+    company.sharesOutstanding = Math.max(1, company.companyValue / livePrice);
+    company.quarterlyDividend = company.dividendYield > 0
+      ? livePrice * company.dividendYield / 4
+      : 0;
+    company.candles = {};
+    company.handoffPrice = livePrice;
+    company.handoffAt = Math.floor(Date.now() / 1000);
+    company.handoffSource = String(row.source || "realistic-game price snapshot");
+
+    updated += 1;
+  }
+
+  marketState.realPriceBootstrapped = updated > 0;
+  marketState.realPriceBootstrapCount = updated;
+  marketState.realPriceBootstrapSource = REAL_PRICE_BOOTSTRAP_URL;
+  marketState.realPriceBootstrapAt = Math.floor(Date.now() / 1000);
+
+  console.log(
+    `[FICTIONAL HANDOFF] Seeded ${updated}/${Object.keys(marketState.companies).length} ` +
+    `simulated tickers from the realistic-game prices.`
+  );
+
+  return updated;
 }
 
 function saveStateNow() {
@@ -760,10 +848,12 @@ function loadState() {
     }
 
     console.log(`[FICTIONAL] Loaded ${Object.keys(marketState.companies).length} main-game companies from persistent state.`);
+    return false;
   } catch (error) {
     marketState = newMarketState();
     saveStateNow();
     console.log(`[FICTIONAL] Started a new ${INITIAL_COMPANIES.length}-company main-game market (${error.code || error.message}).`);
+    return true;
   }
 }
 
@@ -1237,6 +1327,9 @@ app.get("/health", (_req, res) => {
     realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
     realSecondsPerGameDay: REAL_SECONDS_PER_GAME_MINUTE * MINUTES_PER_DAY,
     automaticIposEnabled: false,
+    realPriceBootstrapped: marketState.realPriceBootstrapped === true,
+    realPriceBootstrapCount: Number(marketState.realPriceBootstrapCount) || 0,
+    realPriceBootstrapSource: String(marketState.realPriceBootstrapSource || ""),
     fictionalTradeSecretConfigured: Boolean(FICTIONAL_TRADE_SECRET),
     groupSyncConfigured: Boolean(GROUP_SYNC_SECRET && ROBLOX_OPEN_CLOUD_API_KEY),
     cryptoCached: Object.keys(cryptoPriceCache).length,
@@ -1505,10 +1598,26 @@ app.post("/group-role/sync", async (req, res) => {
   }
 });
 
-loadState();
-setInterval(engineStep, 1000);
+async function startServer() {
+  const freshState = loadState();
 
-app.listen(PORT, () => {
-  console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
-  console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; real crypto and commodities enabled.`);
+  if (freshState) {
+    await bootstrapFreshStateFromRealPrices();
+    saveStateNow();
+  }
+
+  setInterval(engineStep, 1000);
+
+  app.listen(PORT, () => {
+    const clock = marketClock();
+    console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
+    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; real crypto and commodities enabled.`);
+    console.log(`[SERVER] Fictional clock starts/resumes at ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
+    console.log(`[SERVER] Real-price handoff: ${marketState.realPriceBootstrapCount || 0} tickers.`);
+  });
+}
+
+startServer().catch(error => {
+  console.error(`[SERVER] Startup failed: ${error && error.stack || error}`);
+  process.exit(1);
 });
