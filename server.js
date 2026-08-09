@@ -442,7 +442,7 @@ const CLOCK_START_MINUTE = clamp(
   0,
   MINUTES_PER_WEEK - 1
 );
-const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v3-real-price-handoff-2026-08-09";
+const FICTIONAL_CATALOG_VERSION = "main-game-current-tickers-v4-safe-exact-handoff-2026-08-09";
 const FICTIONAL_TRADE_SECRET = String(process.env.FICTIONAL_MARKET_SECRET || "");
 const STATE_FILE = String(
   process.env.FICTIONAL_STATE_FILE ||
@@ -684,6 +684,10 @@ function newMarketState() {
     companies,
     news: [],
     tradeReceipts: {},
+    handoffReady: false,
+    handoffPriceCount: 0,
+    handoffSource: "",
+    handoffAt: 0,
     realPriceBootstrapped: false,
     realPriceBootstrapCount: 0,
     realPriceBootstrapSource: ""
@@ -700,83 +704,112 @@ function newMarketState() {
 }
 
 
-async function bootstrapFreshStateFromRealPrices() {
-  if (!marketState || !REAL_PRICE_BOOTSTRAP_URL) return 0;
+function requiredHandoffTickers() {
+  return INITIAL_COMPANIES.map(seed => seed[0]);
+}
 
-  let rows = null;
-  let lastError = null;
+function handoffStatusPayload() {
+  return {
+    success: true,
+    handoffReady: marketState?.handoffReady === true,
+    handoffPriceCount: Number(marketState?.handoffPriceCount) || 0,
+    handoffSource: String(marketState?.handoffSource || ""),
+    handoffAt: Number(marketState?.handoffAt) || 0,
+    requiredTickerCount: INITIAL_COMPANIES.length,
+    requiredTickers: requiredHandoffTickers(),
+    catalogVersion: FICTIONAL_CATALOG_VERSION
+  };
+}
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const separator = REAL_PRICE_BOOTSTRAP_URL.includes("?") ? "&" : "?";
-      const url = `${REAL_PRICE_BOOTSTRAP_URL}${separator}_handoff=${Date.now()}`;
-      const response = await fetchJson(
-        url,
-        { headers: { Accept: "application/json", "User-Agent": "Godly-Capital-Fictional-Handoff/1.0" } },
-        20000
-      );
-
-      if (!response.ok || !response.data || typeof response.data !== "object" || Array.isArray(response.data)) {
-        throw new Error(`real-price bootstrap HTTP ${response.status}`);
-      }
-
-      rows = response.data;
-      break;
-    } catch (error) {
-      lastError = error;
-      console.warn(`[FICTIONAL HANDOFF] Real-price bootstrap attempt ${attempt} failed: ${error.message}`);
-      if (attempt < 2) {
-        await new Promise(resolve => setTimeout(resolve, 1500));
-      }
-    }
+function applyExactHandoffPrices(inputRows, source = "Roblox realistic-market handoff") {
+  if (!marketState) throw new Error("Market state is unavailable.");
+  if (!inputRows || typeof inputRows !== "object" || Array.isArray(inputRows)) {
+    throw new Error("Handoff prices must be an object keyed by in-game ticker.");
   }
 
-  if (!rows) {
-    console.warn(
-      `[FICTIONAL HANDOFF] Could not snapshot the realistic-game prices. ` +
-      `Using configured fallback prices instead. ${lastError ? lastError.message : ""}`
-    );
-    return 0;
-  }
-
-  let updated = 0;
+  // Validate EVERYTHING first. Never partially seed the market.
+  const prepared = [];
+  const missing = [];
 
   for (const company of Object.values(marketState.companies)) {
-    const row = rows[company.ticker];
-    const livePrice = row && asNumber(row.price);
+    const raw = inputRows[company.ticker];
+    const row = raw && typeof raw === "object" ? raw : { price: raw };
+    const price = asNumber(row && row.price);
+    const prevClose = asNumber(row && row.prevClose);
 
-    if (!(livePrice > 0)) continue;
+    if (!(price > 0)) {
+      missing.push(company.ticker);
+      continue;
+    }
 
-    // Preserve company scale/fundamentals while making fair value equal the exact
-    // real-game handoff price. This prevents the fair-value pull from dragging a
-    // newly handed-off stock back toward the old hard-coded seed price.
+    prepared.push({
+      company,
+      price,
+      prevClose: prevClose > 0 ? prevClose : price,
+      source: String((row && row.source) || source || "Roblox realistic-market handoff")
+    });
+  }
+
+  if (missing.length > 0 || prepared.length !== INITIAL_COMPANIES.length) {
+    const error = new Error(
+      `Exact handoff refused: ${missing.length} ticker(s) are missing a valid real-market price: ${missing.join(", ")}`
+    );
+    error.code = "INCOMPLETE_HANDOFF";
+    error.missingTickers = missing;
+    throw error;
+  }
+
+  // Only after all required prices validate do we mutate a single company.
+  const nowUnix = Math.floor(Date.now() / 1000);
+  for (const item of prepared) {
+    const company = item.company;
+    const livePrice = item.price;
+
     company.price = livePrice;
-    company.prevClose = livePrice;
+    company.prevClose = item.prevClose;
     company.initialPrice = livePrice;
     company.ipoPrice = livePrice;
+
+    // Keep the simulation's company-value scale, but make fair value exactly
+    // equal the handoff price at the instant fictional trading takes over.
     company.sharesOutstanding = Math.max(1, company.companyValue / livePrice);
     company.quarterlyDividend = company.dividendYield > 0
       ? livePrice * company.dividendYield / 4
       : 0;
+
     company.candles = {};
     company.handoffPrice = livePrice;
-    company.handoffAt = Math.floor(Date.now() / 1000);
-    company.handoffSource = String(row.source || "realistic-game price snapshot");
-
-    updated += 1;
+    company.handoffPrevClose = item.prevClose;
+    company.handoffAt = nowUnix;
+    company.handoffSource = item.source;
   }
 
-  marketState.realPriceBootstrapped = updated > 0;
-  marketState.realPriceBootstrapCount = updated;
-  marketState.realPriceBootstrapSource = REAL_PRICE_BOOTSTRAP_URL;
-  marketState.realPriceBootstrapAt = Math.floor(Date.now() / 1000);
+  // The fictional clock starts NOW, not when Railway happened to deploy.
+  marketState.clockAnchorRealMs = Date.now();
+  marketState.clockAnchorGameSeconds = CLOCK_START_MINUTE * 60;
+  marketState.lastUpdatedGameMinute = CLOCK_START_MINUTE;
+  marketState.nextNewsGameMinute = CLOCK_START_MINUTE + 120;
+  marketState.lastCloseDayIndex = nil;
+
+  marketState.handoffReady = true;
+  marketState.handoffPriceCount = prepared.length;
+  marketState.handoffSource = String(source || "Roblox realistic-market handoff");
+  marketState.handoffAt = nowUnix;
+
+  // Keep compatibility with the diagnostics fields from the previous build.
+  marketState.realPriceBootstrapped = true;
+  marketState.realPriceBootstrapCount = prepared.length;
+  marketState.realPriceBootstrapSource = marketState.handoffSource;
+  marketState.realPriceBootstrapAt = nowUnix;
+
+  saveStateNow();
 
   console.log(
-    `[FICTIONAL HANDOFF] Seeded ${updated}/${Object.keys(marketState.companies).length} ` +
-    `simulated tickers from the realistic-game prices.`
+    `[FICTIONAL HANDOFF] EXACT handoff completed for ${prepared.length}/${INITIAL_COMPANIES.length} tickers. ` +
+    `VSS=$${Number(marketState.companies.VSS?.price || 0).toFixed(4)}`
   );
 
-  return updated;
+  return handoffStatusPayload();
 }
 
 function saveStateNow() {
@@ -818,6 +851,10 @@ function loadState() {
     marketState.tradeReceipts = marketState.tradeReceipts || {};
     marketState.catalogVersion = FICTIONAL_CATALOG_VERSION;
     marketState.clockMode = "accelerated-fictional-week";
+    marketState.handoffReady = marketState.handoffReady === true;
+    marketState.handoffPriceCount = Number(marketState.handoffPriceCount) || 0;
+    marketState.handoffSource = String(marketState.handoffSource || "");
+    marketState.handoffAt = Number(marketState.handoffAt) || 0;
 
     if (!Number.isFinite(Number(marketState.clockAnchorRealMs))) {
       marketState.clockAnchorRealMs = Date.now();
@@ -1118,6 +1155,7 @@ function createWeeklyIpo(week, clock) {
 
 function engineStep() {
   if (!marketState) return;
+  if (marketState.handoffReady !== true) return;
   const clock = marketClock();
   const elapsedGameMinutes = clamp(clock.totalMinutes - Number(marketState.lastUpdatedGameMinute || clock.totalMinutes), 0, MINUTES_PER_DAY);
 
@@ -1327,6 +1365,11 @@ app.get("/health", (_req, res) => {
     realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
     realSecondsPerGameDay: REAL_SECONDS_PER_GAME_MINUTE * MINUTES_PER_DAY,
     automaticIposEnabled: false,
+    handoffReady: marketState.handoffReady === true,
+    handoffPriceCount: Number(marketState.handoffPriceCount) || 0,
+    handoffSource: String(marketState.handoffSource || ""),
+    handoffAt: Number(marketState.handoffAt) || 0,
+    requiredHandoffTickerCount: INITIAL_COMPANIES.length,
     realPriceBootstrapped: marketState.realPriceBootstrapped === true,
     realPriceBootstrapCount: Number(marketState.realPriceBootstrapCount) || 0,
     realPriceBootstrapSource: String(marketState.realPriceBootstrapSource || ""),
@@ -1396,6 +1439,39 @@ app.get("/commodity/candles", async (req, res) => {
   res.json(await getCommodityCandles(ticker, String(req.query.interval || "1m").toLowerCase()));
 });
 
+app.get("/fictional/handoff/status", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+  res.json(handoffStatusPayload());
+});
+
+app.post("/fictional/handoff", (req, res) => {
+  if (!authorizeFictionalTrade(req, res)) return;
+
+  // Idempotent: once the exact handoff is complete, later Roblox servers may
+  // check/post without ever resetting the shared market price.
+  if (marketState.handoffReady === true) {
+    return res.json({
+      ...handoffStatusPayload(),
+      alreadyReady: true
+    });
+  }
+
+  try {
+    const prices = req.body?.prices;
+    const source = String(req.body?.source || "Roblox realistic-market handoff").slice(0, 160);
+    const result = applyExactHandoffPrices(prices, source);
+    return res.json(result);
+  } catch (error) {
+    return res.status(409).json({
+      success: false,
+      handoffReady: false,
+      error: error.message,
+      code: error.code || "HANDOFF_FAILED",
+      missingTickers: Array.isArray(error.missingTickers) ? error.missingTickers : []
+    });
+  }
+});
+
 app.get("/fictional/market/status", (_req, res) => {
   engineStep();
   const clock = marketClock();
@@ -1411,11 +1487,20 @@ app.get("/fictional/market/status", (_req, res) => {
     companyCount: Object.keys(marketState.companies).length,
     lastIpoWeek: 0,
     automaticIposEnabled: false,
+    handoffReady: marketState.handoffReady === true,
+    handoffPriceCount: Number(marketState.handoffPriceCount) || 0,
     nextNewsGameMinute: marketState.nextNewsGameMinute
   });
 });
 
 app.get("/fictional/prices", (_req, res) => {
+  if (marketState.handoffReady !== true) {
+    return res.status(503).json({
+      success: false,
+      handoffReady: false,
+      error: "Fictional market is waiting for an exact real-price handoff. Seed/fallback prices are not being served."
+    });
+  }
   engineStep();
   const clock = marketClock();
   const prices = {};
@@ -1424,6 +1509,13 @@ app.get("/fictional/prices", (_req, res) => {
 });
 
 app.get("/fictional/price", (req, res) => {
+  if (marketState.handoffReady !== true) {
+    return res.status(503).json({
+      success: false,
+      handoffReady: false,
+      error: "Fictional market is waiting for an exact real-price handoff."
+    });
+  }
   engineStep();
   const ticker = normalizeFictionalTicker(req.query.ticker);
   const company = marketState.companies[ticker];
@@ -1432,6 +1524,13 @@ app.get("/fictional/price", (req, res) => {
 });
 
 app.get("/fictional/candles", (req, res) => {
+  if (marketState.handoffReady !== true) {
+    return res.status(503).json({
+      success: false,
+      handoffReady: false,
+      error: "Fictional market is waiting for an exact real-price handoff."
+    });
+  }
   engineStep();
   const ticker = normalizeFictionalTicker(req.query.ticker);
   const interval = String(req.query.interval || "1m").toLowerCase();
@@ -1513,6 +1612,13 @@ app.get("/fictional/ipo/current", (_req, res) => {
 
 app.post("/fictional/trade", (req, res) => {
   if (!authorizeFictionalTrade(req, res)) return;
+  if (marketState.handoffReady !== true) {
+    return res.status(503).json({
+      success: false,
+      handoffReady: false,
+      error: "Fictional market is waiting for an exact real-price handoff."
+    });
+  }
   engineStep();
   const ticker = normalizeFictionalTicker(req.body?.ticker);
   const side = String(req.body?.side || "").toLowerCase();
@@ -1599,12 +1705,7 @@ app.post("/group-role/sync", async (req, res) => {
 });
 
 async function startServer() {
-  const freshState = loadState();
-
-  if (freshState) {
-    await bootstrapFreshStateFromRealPrices();
-    saveStateNow();
-  }
+  loadState();
 
   setInterval(engineStep, 1000);
 
@@ -1612,8 +1713,12 @@ async function startServer() {
     const clock = marketClock();
     console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
     console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; real crypto and commodities enabled.`);
-    console.log(`[SERVER] Fictional clock starts/resumes at ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
-    console.log(`[SERVER] Real-price handoff: ${marketState.realPriceBootstrapCount || 0} tickers.`);
+    console.log(`[SERVER] Fictional clock configured for ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
+    if (marketState.handoffReady === true) {
+      console.log(`[SERVER] Exact price handoff is READY for ${marketState.handoffPriceCount || 0} tickers.`);
+    } else {
+      console.warn(`[SERVER] WAITING FOR EXACT PRICE HANDOFF. Fictional seed prices will NOT be served.`);
+    }
   });
 }
 
