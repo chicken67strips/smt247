@@ -743,6 +743,7 @@ function newMarketState() {
     clockAnchorGameSeconds: CLOCK_START_MINUTE * 60,
     realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
     lastUpdatedGameMinute: CLOCK_START_MINUTE,
+    lastUpdatedGameSecond: CLOCK_START_MINUTE * 60,
     lastIpoWeek: 0,
     nextNewsGameMinute: CLOCK_START_MINUTE + 120,
     companies,
@@ -852,6 +853,7 @@ function applyExactHandoffPrices(inputRows, source = "Roblox realistic-market ha
   marketState.clockAnchorRealMs = Date.now();
   marketState.clockAnchorGameSeconds = CLOCK_START_MINUTE * 60;
   marketState.lastUpdatedGameMinute = CLOCK_START_MINUTE;
+  marketState.lastUpdatedGameSecond = CLOCK_START_MINUTE * 60;
   marketState.nextNewsGameMinute = CLOCK_START_MINUTE + 120;
   marketState.lastCloseDayIndex = null;
 
@@ -1141,6 +1143,11 @@ function loadState() {
     if (!Number.isFinite(Number(marketState.lastUpdatedGameMinute))) {
       marketState.lastUpdatedGameMinute = clock.totalMinutes;
     }
+    if (!Number.isFinite(Number(marketState.lastUpdatedGameSecond))) {
+      // Upgrade existing v7 persistent state in place. Start second-resolution
+      // evolution from NOW so deployment does not create a price jump.
+      marketState.lastUpdatedGameSecond = clock.totalGameSeconds;
+    }
     if (!Number.isFinite(Number(marketState.nextNewsGameMinute)) || Number(marketState.nextNewsGameMinute) < clock.totalMinutes - 1440) {
       marketState.nextNewsGameMinute = clock.totalMinutes + 120;
     }
@@ -1274,13 +1281,23 @@ function ensureCandleSeries(company, intervalKey) {
   return company.candles[intervalKey];
 }
 
-function updateCandles(company, priorPrice, price, clock, playerVolume = 0) {
+function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elapsedGameMinutes = 0) {
   for (const [intervalKey, spec] of Object.entries(FICTIONAL_INTERVALS)) {
     const series = ensureCandleSeries(company, intervalKey);
     const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
     const current = series[series.length - 1];
     const currentBucket = current ? Number(current.bucketMinute) : null;
-    const volume = Math.max(1, Math.round((120 + Math.random() * 900) * spec.minutes * company.liquidity + playerVolume));
+
+    // Natural volume is a flow over game time. With sub-minute price ticks,
+    // scale it by the actual elapsed game minutes instead of repeatedly adding
+    // a full timeframe's volume on every tick.
+    const naturalVolume = (120 + Math.random() * 900)
+      * Math.max(0, Number(elapsedGameMinutes) || 0)
+      * company.liquidity;
+    const volume = Math.max(1, Math.round(
+      naturalVolume + Math.max(0, Number(playerVolume) || 0)
+    ));
+
     if (!current || currentBucket !== bucket) {
       series.push(candleRecord(bucket, priorPrice, Math.max(priorPrice, price), Math.min(priorPrice, price), price, volume, clock.session));
       if (series.length > spec.limit) series.splice(0, series.length - spec.limit);
@@ -1306,7 +1323,7 @@ function updateCompany(company, elapsedGameMinutes, clock) {
   const fairPull = ((fairPrice - company.price) / Math.max(company.price, 0.01)) * clamp(elapsedGameMinutes / 240, 0, 0.22);
   const prior = company.price;
   company.price = Math.max(0.05, company.price * Math.exp(randomMove + fairPull));
-  updateCandles(company, prior, company.price, clock);
+  updateCandles(company, prior, company.price, clock, 0, elapsedGameMinutes);
 }
 
 function newsTemplate(positive) {
@@ -1418,12 +1435,25 @@ function engineStep() {
   if (!marketState) return;
   if (marketState.handoffReady !== true) return;
   const clock = marketClock();
-  const elapsedGameMinutes = clamp(clock.totalMinutes - Number(marketState.lastUpdatedGameMinute || clock.totalMinutes), 0, MINUTES_PER_DAY);
 
-  if (elapsedGameMinutes > 0) {
+  // Evolve prices at game-second resolution while candles remain grouped into
+  // 1m/5m/15m/etc. buckets. At 2x time, one real second advances roughly two
+  // game seconds, so the active candle can visibly move before it closes.
+  const lastGameSecond = Number.isFinite(Number(marketState.lastUpdatedGameSecond))
+    ? Number(marketState.lastUpdatedGameSecond)
+    : clock.totalGameSeconds;
+  const elapsedGameSeconds = clamp(
+    clock.totalGameSeconds - lastGameSecond,
+    0,
+    MINUTES_PER_DAY * 60
+  );
+  const elapsedGameMinutes = elapsedGameSeconds / 60;
+
+  if (elapsedGameSeconds > 0) {
     for (const company of Object.values(marketState.companies)) {
       updateCompany(company, elapsedGameMinutes, clock);
     }
+    marketState.lastUpdatedGameSecond = clock.totalGameSeconds;
     marketState.lastUpdatedGameMinute = clock.totalMinutes;
   }
 
@@ -1910,7 +1940,7 @@ app.post("/fictional/trade", (req, res) => {
   const executionPrice = priorPrice * (1 + (side === "buy" ? spread / 2 : -spread / 2) + signedImpact / 2);
   company.price = Math.max(0.05, priorPrice * (1 + signedImpact));
   if (side === "buy") company.buyVolume += quantity; else company.sellVolume += quantity;
-  updateCandles(company, priorPrice, company.price, clock, quantity);
+  updateCandles(company, priorPrice, company.price, clock, quantity, 0);
   const result = {
     success: true, requestId, ticker, side, quantity,
     executionPrice: round(executionPrice, 4),
@@ -1989,6 +2019,7 @@ async function startServer() {
     const clock = marketClock();
     console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
     console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; real crypto and commodities enabled.`);
+console.log(`[SERVER] Fictional stock prices evolve at game-second resolution; candles retain normal timeframe buckets.`);
     console.log(`[SERVER] Fictional clock configured for ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
     if (marketState.handoffReady === true) {
       console.log(`[SERVER] Exact price handoff is READY for ${marketState.handoffPriceCount || 0} tickers.`);
