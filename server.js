@@ -1,6 +1,6 @@
 // Dedicated Railway backend for the fictional-stock game.
 // This project intentionally contains NO real-stock ticker mappings or routes.
-// Fictional stocks are simulated here; crypto and commodities use real data.
+// Fictional stocks and crypto are simulated here. Crypto uses zero real-world crypto data.
 
 const express = require("express");
 const fs = require("fs");
@@ -85,221 +85,414 @@ function makeRealCandle(timestamp, open, high, low, close, volume, session) {
 }
 
 // ============================
-// Real cryptocurrency
+// Fully fictional cryptocurrency
 // ============================
-const CRYPTO_SYMBOLS = ["BTC", "ETH", "SOL", "DOGE", "LTC"];
-const CRYPTO_IDS = {
-  BTC: "bitcoin",
-  ETH: "ethereum",
-  SOL: "solana",
-  DOGE: "dogecoin",
-  LTC: "litecoin"
-};
-const COINBASE_PRODUCTS = {
-  BTC: "BTC-USD",
-  ETH: "ETH-USD",
-  SOL: "SOL-USD",
-  DOGE: "DOGE-USD",
-  LTC: "LTC-USD"
-};
-const cryptoPriceCache = {};
-const cryptoCandleCache = new Map();
-const CRYPTO_PRICE_TTL_MS = 1500;
-const CRYPTO_CANDLE_TTL_MS = 8000;
-const CRYPTO_PROVIDER_MAX_AGE_MS = 2 * 60 * 1000;
-const COINGECKO_PROVIDER_MAX_AGE_MS = 5 * 60 * 1000;
+// IMPORTANT:
+// These assets are original in-game simulations. They have no mapping to any
+// real cryptocurrency, and this section makes
+// no outbound request to any real crypto-data provider.
+//
+// Crypto uses the same accelerated game clock as the stock simulation, but it
+// trades 24/7, including fictional nights and weekends.
+const CRYPTO_SYMBOLS = ["GYLD", "KRVN", "ZYPH", "QNTA", "VEXL"];
 
-function cryptoProviderTimeIsCurrent(timestampMs, maxAgeMs = CRYPTO_PROVIDER_MAX_AGE_MS) {
-  const value = Number(timestampMs);
-  if (!Number.isFinite(value) || value <= 0) return false;
-  const age = Date.now() - value;
-  return age >= -30000 && age <= maxAgeMs;
-}
-
-function cryptoRowIsCurrent(row, maxAgeMs = COINGECKO_PROVIDER_MAX_AGE_MS) {
-  if (!row || !(asNumber(row.price) > 0)) return false;
-  const providerTimeMs = (asNumber(row.lastUpdated) || 0) * 1000;
-  const receivedAtMs = asNumber(row.receivedAtMs) || 0;
-  return cryptoProviderTimeIsCurrent(providerTimeMs, maxAgeMs)
-    && receivedAtMs > 0
-    && Date.now() - receivedAtMs <= maxAgeMs;
-}
+const FICTIONAL_CRYPTO_SEEDS = [
+  {
+    symbol: "GYLD",
+    name: "Gyldra",
+    initialPrice: 82.40,
+    annualGrowth: 0.18,
+    annualVolatility: 0.62,
+    totalSupply: 25000000,
+    liquidity: 0.95,
+    baseVolumePerGameMinute: 46000
+  },
+  {
+    symbol: "KRVN",
+    name: "Korvane",
+    initialPrice: 14.75,
+    annualGrowth: 0.24,
+    annualVolatility: 0.88,
+    totalSupply: 90000000,
+    liquidity: 0.82,
+    baseVolumePerGameMinute: 76000
+  },
+  {
+    symbol: "ZYPH",
+    name: "Zyphra",
+    initialPrice: 0.842,
+    annualGrowth: 0.12,
+    annualVolatility: 1.15,
+    totalSupply: 1400000000,
+    liquidity: 0.72,
+    baseVolumePerGameMinute: 145000
+  },
+  {
+    symbol: "QNTA",
+    name: "Quentara",
+    initialPrice: 235.60,
+    annualGrowth: 0.20,
+    annualVolatility: 0.55,
+    totalSupply: 12000000,
+    liquidity: 0.92,
+    baseVolumePerGameMinute: 33000
+  },
+  {
+    symbol: "VEXL",
+    name: "Vexalon",
+    initialPrice: 0.0315,
+    annualGrowth: 0.05,
+    annualVolatility: 1.85,
+    totalSupply: 18000000000,
+    liquidity: 0.58,
+    baseVolumePerGameMinute: 390000
+  }
+];
 
 function normalizeCryptoSymbol(value) {
   const symbol = String(value || "").toUpperCase().replace(/[^A-Z]/g, "");
   return CRYPTO_SYMBOLS.includes(symbol) ? symbol : "";
 }
 
-async function fetchBinanceTicker(symbol, host) {
-  const response = await fetchJson(
-    `https://${host}/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol + "USDT")}`,
-    { headers: { Accept: "application/json" } },
-    6500
-  );
-  if (!response.ok || !response.data) throw new Error(`${host} HTTP ${response.status}`);
-  const price = asNumber(response.data.lastPrice);
-  if (!(price > 0)) throw new Error(`${host} returned no price`);
-  const providerTimeMs = asNumber(response.data.closeTime);
-  if (!cryptoProviderTimeIsCurrent(providerTimeMs)) {
-    throw new Error(`${host} returned a stale ${symbol} quote`);
-  }
+function makeFictionalCryptoFromSeed(seed) {
+  const price = Math.max(0.00000001, Number(seed.initialPrice) || 1);
   return {
-    symbol,
+    symbol: seed.symbol,
+    name: seed.name,
+    initialPrice: price,
     price,
-    change24h: asNumber(response.data.priceChangePercent) || 0,
-    volume24h: asNumber(response.data.quoteVolume) || 0,
-    source: host.includes("binance.us") ? "Binance.US" : "Binance",
-    lastUpdated: Math.floor(providerTimeMs / 1000),
-    receivedAtMs: Date.now()
+    dayOpenPrice: price,
+    annualGrowth: Number(seed.annualGrowth) || 0,
+    annualVolatility: Math.max(0.01, Number(seed.annualVolatility) || 0.5),
+    totalSupply: Math.max(1, Number(seed.totalSupply) || 1),
+    liquidity: clamp(Number(seed.liquidity) || 0.7, 0.05, 1),
+    baseVolumePerGameMinute: Math.max(1, Number(seed.baseVolumePerGameMinute) || 10000),
+    volume24h: 0,
+    lastDayIndex: null,
+    candles: {}
   };
 }
 
-async function fetchCoinbaseTicker(symbol) {
-  const product = COINBASE_PRODUCTS[symbol];
-  if (!product) throw new Error(`Coinbase does not support ${symbol}`);
+function buildInitialSimulatedCryptoMap() {
+  const cryptos = {};
+  for (const seed of FICTIONAL_CRYPTO_SEEDS) {
+    cryptos[seed.symbol] = makeFictionalCryptoFromSeed(seed);
+  }
+  return cryptos;
+}
 
-  const [tickerResult, statsResult] = await Promise.allSettled([
-    fetchJson(
-      `https://api.exchange.coinbase.com/products/${encodeURIComponent(product)}/ticker`,
-      { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
-      7000
-    ),
-    fetchJson(
-      `https://api.exchange.coinbase.com/products/${encodeURIComponent(product)}/stats`,
-      { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
-      7000
-    )
-  ]);
+function ensureSimulatedCryptoState(state) {
+  if (!state || typeof state !== "object") return;
 
-  if (tickerResult.status !== "fulfilled" || !tickerResult.value.ok) {
-    throw new Error(`Coinbase ${symbol} ticker unavailable`);
+  if (!state.cryptos || typeof state.cryptos !== "object" || Array.isArray(state.cryptos)) {
+    state.cryptos = {};
   }
 
-  const ticker = tickerResult.value.data || {};
-  const price = asNumber(ticker.price);
-  const providerTimeMs = Date.parse(String(ticker.time || ""));
-  if (!(price > 0)) throw new Error(`Coinbase returned no ${symbol} price`);
-  if (!cryptoProviderTimeIsCurrent(providerTimeMs)) {
-    throw new Error(`Coinbase returned a stale ${symbol} trade`);
+  for (const seed of FICTIONAL_CRYPTO_SEEDS) {
+    let asset = state.cryptos[seed.symbol];
+    if (!asset || typeof asset !== "object") {
+      asset = makeFictionalCryptoFromSeed(seed);
+      state.cryptos[seed.symbol] = asset;
+    }
+
+    asset.symbol = seed.symbol;
+    asset.name = seed.name;
+
+    if (!(asNumber(asset.initialPrice) > 0)) asset.initialPrice = seed.initialPrice;
+    if (!(asNumber(asset.price) > 0)) asset.price = seed.initialPrice;
+    if (!(asNumber(asset.dayOpenPrice) > 0)) asset.dayOpenPrice = asset.price;
+
+    asset.annualGrowth = Number(seed.annualGrowth) || 0;
+    asset.annualVolatility = Math.max(0.01, Number(seed.annualVolatility) || 0.5);
+    asset.totalSupply = Math.max(1, Number(seed.totalSupply) || 1);
+    asset.liquidity = clamp(Number(seed.liquidity) || 0.7, 0.05, 1);
+    asset.baseVolumePerGameMinute = Math.max(1, Number(seed.baseVolumePerGameMinute) || 10000);
+    asset.volume24h = Math.max(0, Number(asset.volume24h) || 0);
+    asset.lastDayIndex = Number.isFinite(Number(asset.lastDayIndex))
+      ? Number(asset.lastDayIndex)
+      : null;
+    asset.candles = asset.candles && typeof asset.candles === "object"
+      ? asset.candles
+      : {};
   }
 
-  const stats = statsResult.status === "fulfilled" && statsResult.value.ok
-    ? (statsResult.value.data || {})
-    : {};
-  const open = asNumber(stats.open);
-  const baseVolume = asNumber(stats.volume);
+  // Remove no-longer-supported fictional crypto entries if the catalog changes.
+  for (const symbol of Object.keys(state.cryptos)) {
+    if (!CRYPTO_SYMBOLS.includes(symbol)) {
+      delete state.cryptos[symbol];
+    }
+  }
+}
+
+function makeFictionalCryptoCandle(bucketMinute, open, high, low, close, volume) {
+  const safeBucket = Math.max(0, Math.floor(Number(bucketMinute) || 0));
+  const dayIndex = Math.floor(safeBucket / MINUTES_PER_DAY);
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay = ((safeBucket % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+  const hour = Math.floor(minuteOfDay / 60);
+  const minute = minuteOfDay % 60;
+
+  const o = round(Math.max(0.00000001, Number(open) || 0), 8);
+  const c = round(Math.max(0.00000001, Number(close) || o), 8);
+  const h = round(Math.max(o, c, Number(high) || o), 8);
+  const l = round(Math.max(0.00000001, Math.min(o, c, Number(low) || o)), 8);
+  const v = Math.max(0, Math.round(Number(volume) || 0));
 
   return {
-    symbol,
-    price,
-    change24h: open > 0 ? ((price - open) / open) * 100 : 0,
-    volume24h: baseVolume >= 0 ? baseVolume * price : 0,
-    source: "Coinbase Exchange USD spot",
-    lastUpdated: Math.floor(providerTimeMs / 1000),
-    receivedAtMs: Date.now()
+    t: safeBucket * 60,
+    ts: safeBucket * 60,
+    time: safeBucket * 60,
+    timestamp: safeBucket * 60,
+    bucketMinute: safeBucket,
+    datetime: `${DAY_NAMES[dayOfWeekIndex]} ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
+    o, h, l, c, v,
+    open: o,
+    high: h,
+    low: l,
+    close: c,
+    volume: v,
+    session: "crypto",
+    fictional: true,
+    assetType: "crypto",
+    gameDayIndex: dayIndex,
+    gameDayName: DAY_NAMES[dayOfWeekIndex],
+    gameMinuteOfDay: minuteOfDay
   };
 }
 
-async function fetchCoinGeckoPrices(symbols) {
-  const ids = symbols.map(symbol => CRYPTO_IDS[symbol]).filter(Boolean);
-  const response = await fetchJson(
-    `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(ids.join(","))}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_last_updated_at=true`,
-    { headers: { Accept: "application/json", "User-Agent": "Godly-Exchange/1.0" } },
-    8000
-  );
-  if (!response.ok || !response.data) throw new Error(`CoinGecko HTTP ${response.status}`);
-  const rows = {};
-  for (const symbol of symbols) {
-    const row = response.data[CRYPTO_IDS[symbol]];
-    const price = row && asNumber(row.usd);
-    const providerTimeMs = row && asNumber(row.last_updated_at) * 1000;
-    if (price > 0 && cryptoProviderTimeIsCurrent(providerTimeMs, COINGECKO_PROVIDER_MAX_AGE_MS)) {
-      rows[symbol] = {
-        symbol,
+function ensureCryptoCandleSeries(asset, intervalKey) {
+  asset.candles = asset.candles || {};
+  if (Array.isArray(asset.candles[intervalKey]) && asset.candles[intervalKey].length) {
+    return asset.candles[intervalKey];
+  }
+
+  const spec = FICTIONAL_INTERVALS[intervalKey];
+  if (!spec) return [];
+
+  const nowMinute = marketClock().totalMinutes;
+  const buckets = [];
+  let cursor = Math.floor(nowMinute / spec.minutes) * spec.minutes;
+
+  while (buckets.length < 220) {
+    buckets.push(cursor);
+    cursor -= spec.minutes;
+  }
+
+  buckets.reverse();
+
+  const series = [];
+  let price = Math.max(0.00000001, Number(asset.initialPrice || asset.price) || 1);
+
+  for (const bucket of buckets) {
+    const open = price;
+    const elapsedMinutes = spec.minutes;
+    const drift =
+      asset.annualGrowth * elapsedMinutes / (365 * MINUTES_PER_DAY);
+    const sigma =
+      asset.annualVolatility * Math.sqrt(elapsedMinutes / (365 * MINUTES_PER_DAY));
+
+    price = Math.max(
+      0.00000001,
+      open * Math.exp(drift + randomNormal() * sigma)
+    );
+
+    const wickSize = Math.abs(randomNormal()) * sigma * open * 0.55;
+    const volume =
+      asset.baseVolumePerGameMinute
+      * elapsedMinutes
+      * (0.55 + Math.random() * 0.90);
+
+    series.push(
+      makeFictionalCryptoCandle(
+        bucket,
+        open,
+        Math.max(open, price) + wickSize,
+        Math.max(0.00000001, Math.min(open, price) - wickSize),
         price,
-        change24h: asNumber(row.usd_24h_change) || 0,
-        volume24h: asNumber(row.usd_24h_vol) || 0,
-        source: "CoinGecko",
-        lastUpdated: asNumber(row.last_updated_at) || Math.floor(Date.now() / 1000),
-        receivedAtMs: Date.now()
-      };
+        volume
+      )
+    );
+  }
+
+  if (series.length) {
+    const lastClose = Number(series[series.length - 1].close) || asset.price;
+    const ratio = lastClose > 0 ? asset.price / lastClose : 1;
+
+    for (const candle of series) {
+      candle.open = candle.o = round(candle.open * ratio, 8);
+      candle.high = candle.h = round(candle.high * ratio, 8);
+      candle.low = candle.l = round(Math.max(0.00000001, candle.low * ratio), 8);
+      candle.close = candle.c = round(candle.close * ratio, 8);
     }
   }
-  return rows;
+
+  asset.candles[intervalKey] = series.slice(-spec.limit);
+  return asset.candles[intervalKey];
 }
 
-async function getCryptoPrices(symbols, force = false) {
-  const now = Date.now();
-  const wanted = symbols.filter(symbol => CRYPTO_SYMBOLS.includes(symbol));
-  // Even with fresh=1, do not hammer ten provider endpoints every 1.25 seconds.
-  // Four seconds is still responsive while keeping the public feeds reliable.
-  const refreshTtlMs = force ? 4000 : CRYPTO_PRICE_TTL_MS;
-  const needs = wanted.filter(symbol => !cryptoRowIsCurrent(cryptoPriceCache[symbol]) || now - cryptoPriceCache[symbol].receivedAtMs > refreshTtlMs);
-  if (needs.length) {
-    const failed = [];
-    await Promise.all(needs.map(async symbol => {
-      try {
-        let row;
-        try { row = await fetchBinanceTicker(symbol, "api.binance.com"); }
-        catch (_) { row = await fetchCoinbaseTicker(symbol); }
-        cryptoPriceCache[symbol] = row;
-      } catch (error) {
-        failed.push(symbol);
+function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes = 0) {
+  for (const [intervalKey, spec] of Object.entries(FICTIONAL_INTERVALS)) {
+    const series = ensureCryptoCandleSeries(asset, intervalKey);
+    const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
+    const current = series[series.length - 1];
+    const currentBucket = current ? Number(current.bucketMinute) : null;
+
+    const volume =
+      asset.baseVolumePerGameMinute
+      * Math.max(0, Number(elapsedGameMinutes) || 0)
+      * (0.60 + Math.random() * 0.80);
+
+    if (!current || currentBucket !== bucket) {
+      series.push(
+        makeFictionalCryptoCandle(
+          bucket,
+          priorPrice,
+          Math.max(priorPrice, price),
+          Math.min(priorPrice, price),
+          price,
+          volume
+        )
+      );
+      if (series.length > spec.limit) {
+        series.splice(0, series.length - spec.limit);
       }
-    }));
-    if (failed.length) {
-      try {
-        const fallback = await fetchCoinGeckoPrices(failed);
-        Object.assign(cryptoPriceCache, fallback);
-      } catch (_) {}
+    } else {
+      current.high = current.h = round(Math.max(Number(current.high) || price, price), 8);
+      current.low = current.l = round(
+        Math.max(0.00000001, Math.min(Number(current.low) || price, price)),
+        8
+      );
+      current.close = current.c = round(price, 8);
+      current.volume = current.v = Math.round((Number(current.volume) || 0) + volume);
+      current.session = "crypto";
+      current.fictional = true;
+      current.assetType = "crypto";
+    }
+
+    if (intervalKey === "1m") {
+      asset.volume24h += volume;
     }
   }
-  const prices = {};
-  for (const symbol of wanted) {
-    if (cryptoRowIsCurrent(cryptoPriceCache[symbol])) prices[symbol] = cryptoPriceCache[symbol];
+}
+
+function updateSimulatedCrypto(asset, elapsedGameMinutes, clock) {
+  if (!(elapsedGameMinutes > 0)) return;
+
+  if (Number(asset.lastDayIndex) !== clock.dayIndex) {
+    asset.lastDayIndex = clock.dayIndex;
+    asset.dayOpenPrice = Math.max(0.00000001, Number(asset.price) || asset.initialPrice);
+    asset.volume24h = 0;
   }
-  return { success: Object.keys(prices).length > 0, prices, updatedAt: Math.floor(Date.now() / 1000) };
+
+  const prior = Math.max(0.00000001, Number(asset.price) || asset.initialPrice);
+
+  const drift =
+    asset.annualGrowth * elapsedGameMinutes / (365 * MINUTES_PER_DAY);
+
+  const volatility =
+    asset.annualVolatility
+    * randomNormal()
+    * Math.sqrt(elapsedGameMinutes / (365 * MINUTES_PER_DAY));
+
+  // Very small mean reversion prevents a pure random walk from wandering into
+  // absurd price ranges over long-lived servers while still allowing trends.
+  const reference = Math.max(0.00000001, Number(asset.initialPrice) || prior);
+  const referencePull =
+    Math.log(reference / prior)
+    * clamp(elapsedGameMinutes / (14 * MINUTES_PER_DAY), 0, 0.0015);
+
+  asset.price = Math.max(
+    0.00000001,
+    prior * Math.exp(drift + volatility + referencePull)
+  );
+
+  updateCryptoCandles(asset, prior, asset.price, clock, elapsedGameMinutes);
+}
+
+function fictionalCryptoRow(asset) {
+  const price = Math.max(0.00000001, Number(asset.price) || asset.initialPrice);
+  const dayOpen = Math.max(0.00000001, Number(asset.dayOpenPrice) || price);
+
+  return {
+    symbol: asset.symbol,
+    ticker: asset.symbol,
+    name: asset.name,
+    assetType: "crypto",
+    fictional: true,
+    simulated: true,
+    price: round(price, 8),
+    change24h: round(((price - dayOpen) / dayOpen) * 100, 4),
+    volume24h: round(Math.max(0, Number(asset.volume24h) || 0) * price, 2),
+    marketCap: round(price * Math.max(1, Number(asset.totalSupply) || 1), 2),
+    source: "Godly Capital fictional crypto simulation",
+    lastUpdated: Math.floor(Date.now() / 1000)
+  };
+}
+
+async function getCryptoPrices(symbols) {
+  engineStep();
+  ensureSimulatedCryptoState(marketState);
+
+  const wanted = symbols.filter(symbol => CRYPTO_SYMBOLS.includes(symbol));
+  const prices = {};
+
+  for (const symbol of wanted) {
+    const asset = marketState.cryptos[symbol];
+    if (asset) prices[symbol] = fictionalCryptoRow(asset);
+  }
+
+  return {
+    success: Object.keys(prices).length > 0,
+    fictional: true,
+    simulated: true,
+    streamHealthy: true,
+    stale: false,
+    source: "Godly Capital fictional crypto simulation",
+    prices,
+    updatedAt: Math.floor(Date.now() / 1000)
+  };
 }
 
 async function getCryptoCandles(symbol, interval) {
-  const intervalMap = { "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "1d": "1d" };
-  if (!intervalMap[interval]) return { symbol, interval, error: "Unsupported crypto interval." };
-  const cacheKey = `${symbol}:${interval}`;
-  const cached = cryptoCandleCache.get(cacheKey);
-  if (cached && Date.now() - cached.at < CRYPTO_CANDLE_TTL_MS) return { ...cached.data, cached: true };
+  engineStep();
+  ensureSimulatedCryptoState(marketState);
 
-  let lastError = null;
-  for (const host of ["api.binance.com", "api.binance.us"]) {
-    try {
-      const response = await fetchJson(
-        `https://${host}/api/v3/klines?symbol=${encodeURIComponent(symbol + "USDT")}&interval=${intervalMap[interval]}&limit=500`,
-        { headers: { Accept: "application/json" } },
-        8000
-      );
-      if (!response.ok || !Array.isArray(response.data)) throw new Error(`${host} HTTP ${response.status}`);
-      const candles = response.data.map(row => makeRealCandle(
-        Math.floor(Number(row[0]) / 1000), Number(row[1]), Number(row[2]), Number(row[3]), Number(row[4]), Number(row[5]), "crypto"
-      )).filter(candle => candle.o > 0 && candle.h > 0 && candle.l > 0 && candle.c > 0);
-      if (!candles.length) throw new Error("No usable crypto candles.");
-      const data = {
-        success: true,
-        symbol,
-        ticker: symbol,
-        interval,
-        candles: withRsi(candles),
-        source: host.includes("binance.us") ? "Binance.US" : "Binance",
-        assetType: "crypto",
-        extendedHoursIncluded: true,
-        indicators: { rsiPeriod: 14, rsiSource: "candle-close" }
-      };
-      cryptoCandleCache.set(cacheKey, { at: Date.now(), data });
-      return data;
-    } catch (error) {
-      lastError = error;
-    }
+  if (!FICTIONAL_INTERVALS[interval]) {
+    return {
+      symbol,
+      interval,
+      fictional: true,
+      error: "Unsupported crypto interval."
+    };
   }
-  if (cached) return { ...cached.data, cached: true, stale: true };
-  return { symbol, interval, error: lastError ? lastError.message : "Crypto candle request failed." };
+
+  const asset = marketState.cryptos[symbol];
+  if (!asset) {
+    return {
+      symbol,
+      interval,
+      fictional: true,
+      error: "Unknown fictional crypto symbol."
+    };
+  }
+
+  return {
+    success: true,
+    symbol,
+    ticker: symbol,
+    name: asset.name,
+    interval,
+    fictional: true,
+    simulated: true,
+    assetType: "crypto",
+    source: "Godly Capital fictional crypto simulation",
+    extendedHoursIncluded: true,
+    candles: withRsi(ensureCryptoCandleSeries(asset, interval)),
+    indicators: {
+      rsiPeriod: 14,
+      rsiSource: "candle-close"
+    }
+  };
 }
 
 // ============================
@@ -747,6 +940,7 @@ function newMarketState() {
     lastIpoWeek: 0,
     nextNewsGameMinute: CLOCK_START_MINUTE + 120,
     companies,
+    cryptos: buildInitialSimulatedCryptoMap(),
     news: [],
     tradeReceipts: {},
     handoffReady: false,
@@ -1110,6 +1304,7 @@ function loadState() {
     }
 
     marketState = parsed;
+    ensureSimulatedCryptoState(marketState);
     marketState.news = Array.isArray(marketState.news) ? marketState.news : [];
     marketState.tradeReceipts = marketState.tradeReceipts || {};
     marketState.catalogVersion = FICTIONAL_CATALOG_VERSION;
@@ -1453,6 +1648,12 @@ function engineStep() {
     for (const company of Object.values(marketState.companies)) {
       updateCompany(company, elapsedGameMinutes, clock);
     }
+
+    ensureSimulatedCryptoState(marketState);
+    for (const asset of Object.values(marketState.cryptos)) {
+      updateSimulatedCrypto(asset, elapsedGameMinutes, clock);
+    }
+
     marketState.lastUpdatedGameSecond = clock.totalGameSeconds;
     marketState.lastUpdatedGameMinute = clock.totalMinutes;
   }
@@ -1672,7 +1873,7 @@ app.get("/health", (_req, res) => {
     realPriceBootstrapSource: String(marketState.realPriceBootstrapSource || ""),
     fictionalTradeSecretConfigured: Boolean(FICTIONAL_TRADE_SECRET),
     groupSyncConfigured: Boolean(GROUP_SYNC_SECRET && ROBLOX_OPEN_CLOUD_API_KEY),
-    cryptoCached: Object.keys(cryptoPriceCache).length,
+    cryptoCached: marketState?.cryptos ? Object.keys(marketState.cryptos).length : 0,
     commodityCached: Object.keys(commodityPriceCache).length
   });
 });
@@ -1683,31 +1884,31 @@ app.get("/crypto/prices", async (req, res) => {
     .toUpperCase().replace(/\s+/g, "").replace(/\+/g, ",").split(",")
     .map(normalizeCryptoSymbol).filter(Boolean);
   const unique = [...new Set(symbols.length ? symbols : CRYPTO_SYMBOLS)];
-  res.json(await getCryptoPrices(unique, req.query.fresh === "1" || req.query.fresh === "true"));
+  res.json(await getCryptoPrices(unique));
 });
 
 app.get("/crypto/debug", async (req, res) => {
   res.set("Cache-Control", "no-store");
-  const symbol = normalizeCryptoSymbol(req.query.symbol || "BTC");
+  const symbol = normalizeCryptoSymbol(req.query.symbol || "GYLD");
   if (!symbol) return res.status(400).json({ error: "Unsupported crypto symbol." });
-  const result = await getCryptoPrices([symbol], true);
+  const result = await getCryptoPrices([symbol]);
   const row = result.prices && result.prices[symbol];
   res.json({
     symbol,
+    name: row && row.name,
     price: row && row.price,
+    fictional: true,
+    simulated: true,
     source: row && row.source,
-    providerTimestamp: row && row.lastUpdated,
-    receivedAtMs: row && row.receivedAtMs,
-    providerAgeSeconds: row && row.lastUpdated
-      ? Math.max(0, Math.floor(Date.now() / 1000) - Number(row.lastUpdated))
-      : null,
-    error: row ? null : "No current validated quote was returned."
+    updatedAt: row && row.lastUpdated,
+    externalCryptoDataUsed: false,
+    error: row ? null : "No fictional crypto quote was returned."
   });
 });
 
 app.get("/crypto/candles", async (req, res) => {
   res.set("Cache-Control", "no-store");
-  const symbol = normalizeCryptoSymbol(req.query.symbol || req.query.ticker || "BTC");
+  const symbol = normalizeCryptoSymbol(req.query.symbol || req.query.ticker || "GYLD");
   if (!symbol) return res.status(400).json({ error: "Unsupported crypto symbol." });
   res.json(await getCryptoCandles(symbol, String(req.query.interval || "1m").toLowerCase()));
 });
@@ -2018,7 +2219,7 @@ async function startServer() {
   app.listen(PORT, () => {
     const clock = marketClock();
     console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
-    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; real crypto and commodities enabled.`);
+    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; 5 fully fictional cryptocurrencies enabled; commodities remain separate.`);
 console.log(`[SERVER] Fictional stock prices evolve at game-second resolution; candles retain normal timeframe buckets.`);
     console.log(`[SERVER] Fictional clock configured for ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
     if (marketState.handoffReady === true) {
