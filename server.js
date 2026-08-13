@@ -1944,7 +1944,14 @@ function companyFromSeed(seed, listedGameMinute = 0) {
   const sharesOutstanding = companyValue / ipoPrice;
   return {
     ticker, name, sector, category, subcategory, industry, capGroup, companyValue, sharesOutstanding,
-    price: ipoPrice, prevClose: ipoPrice, initialPrice: ipoPrice,
+    price: ipoPrice,
+    prevClose: ipoPrice,
+    lastRegularClosePrice: ipoPrice,
+    lastRegularCloseDayIndex: null,
+    dailyReferencePrice: ipoPrice,
+    dailyReferenceDayIndex: 0,
+    dailyChangeModelVersion: DAILY_CHANGE_MODEL_VERSION,
+    initialPrice: ipoPrice,
     annualGrowth, annualVolatility, dividendYield,
     quarterlyDividend: dividendYield > 0 ? ipoPrice * dividendYield / 4 : 0,
     liquidity,
@@ -2017,6 +2024,7 @@ function newMarketState() {
     realSecondsPerGameMinute: REAL_SECONDS_PER_GAME_MINUTE,
     lastUpdatedGameMinute: CLOCK_START_MINUTE,
     lastUpdatedGameSecond: CLOCK_START_MINUTE * 60,
+    dailyChangeModelVersion: DAILY_CHANGE_MODEL_VERSION,
     lastIpoWeek: 0,
     nextNewsGameMinute: CLOCK_START_MINUTE + 120,
     companies,
@@ -2106,7 +2114,17 @@ function applyExactHandoffPrices(inputRows, source = "Roblox realistic-market ha
     const livePrice = item.price;
 
     company.price = livePrice;
-    company.prevClose = item.prevClose;
+
+    // Retain the old real-world close only as diagnostics. Fictional daily %
+    // begins from the fictional handoff quote.
+    company.realPrevCloseAtHandoff = item.prevClose;
+    company.prevClose = livePrice;
+    company.lastRegularClosePrice = livePrice;
+    company.lastRegularCloseDayIndex = null;
+    company.dailyReferencePrice = livePrice;
+    company.dailyReferenceDayIndex = 0;
+    company.dailyChangeModelVersion = DAILY_CHANGE_MODEL_VERSION;
+
     company.initialPrice = livePrice;
     company.ipoPrice = livePrice;
 
@@ -2131,6 +2149,7 @@ function applyExactHandoffPrices(inputRows, source = "Roblox realistic-market ha
   marketState.lastUpdatedGameSecond = CLOCK_START_MINUTE * 60;
   marketState.nextNewsGameMinute = CLOCK_START_MINUTE + 120;
   marketState.lastCloseDayIndex = null;
+  marketState.dailyChangeModelVersion = DAILY_CHANGE_MODEL_VERSION;
 
   marketState.handoffReady = true;
   marketState.handoffPriceCount = prepared.length;
@@ -2440,6 +2459,30 @@ function loadState() {
     marketState.realSecondsPerGameMinute = REAL_SECONDS_PER_GAME_MINUTE;
 
     const clock = marketClock();
+
+    if (Number(marketState.dailyChangeModelVersion) !== DAILY_CHANGE_MODEL_VERSION) {
+      let rebasedCount = 0;
+
+      for (const company of Object.values(marketState.companies || {})) {
+        if (migrateCompanyDailyReference(company, clock)) {
+          rebasedCount += 1;
+        }
+      }
+
+      marketState.dailyChangeModelVersion = DAILY_CHANGE_MODEL_VERSION;
+
+      console.log(
+        `[FICTIONAL DAILY CHANGE] Upgraded existing market state. ` +
+        `${rebasedCount} implausible legacy baseline(s) were rebased.`
+      );
+
+      saveStateNow();
+    } else {
+      for (const company of Object.values(marketState.companies || {})) {
+        ensureDailyReferenceForTradingDay(company, clock);
+      }
+    }
+
     if (!Number.isFinite(Number(marketState.lastUpdatedGameMinute))) {
       marketState.lastUpdatedGameMinute = clock.totalMinutes;
     }
@@ -2466,16 +2509,132 @@ function marketStateName(session) {
   return session === "open" ? "REGULAR" : session === "pre-market" ? "PRE" : session === "after-hours" ? "POST" : "CLOSED";
 }
 
+
+// ============================
+// Fictional daily-change baseline
+// ============================
+// Daily % compares against the PREVIOUS regular-session close.
+//
+// Keep two values:
+//   lastRegularClosePrice = latest fictional 4:00 PM close
+//   dailyReferencePrice   = baseline used for the CURRENT trading day's %
+//
+// A 4:00 PM close is saved without resetting today's % to zero. It becomes the
+// new baseline on the next weekday. Friday's close therefore carries to Monday.
+const DAILY_CHANGE_MODEL_VERSION = 2;
+
+function stockDailySanityLimitPct(company) {
+  const annualVolatility = Math.max(
+    0.01,
+    Number(company?.annualVolatility) || 0.30
+  );
+
+  const dailySigmaPct =
+    annualVolatility * 100 / Math.sqrt(252);
+
+  return Math.max(
+    4.0,
+    dailySigmaPct * 4 + 1.75
+  );
+}
+
+function migrateCompanyDailyReference(company, clock) {
+  if (!company || typeof company !== "object") return false;
+
+  const currentDisplay = displayedPriceForAsset(company);
+  const existingLastClose = Number(company.lastRegularClosePrice);
+  const existingPrevClose = Number(company.prevClose);
+
+  let candidate =
+    existingLastClose > 0
+      ? existingLastClose
+      : existingPrevClose > 0
+        ? existingPrevClose
+        : currentDisplay;
+
+  const changeFromCandidate =
+    candidate > 0
+      ? Math.abs((currentDisplay - candidate) / candidate) * 100
+      : Infinity;
+
+  const sanityLimit = stockDailySanityLimitPct(company);
+  let rebased = false;
+
+  if (
+    !(candidate > 0)
+    || !Number.isFinite(changeFromCandidate)
+    || changeFromCandidate > sanityLimit
+  ) {
+    // Older builds did not persist enough information to reconstruct a true
+    // fictional previous close once the saved baseline is obviously corrupted.
+    // Rebase only the bad asset instead of displaying a fabricated move.
+    candidate = currentDisplay;
+    rebased = true;
+    company.dailyReferenceRebasedAt = Math.floor(Date.now() / 1000);
+    company.dailyReferenceRebaseReason = "implausible_legacy_baseline";
+  }
+
+  company.lastRegularClosePrice = candidate;
+  company.lastRegularCloseDayIndex =
+    Number.isFinite(Number(marketState?.lastCloseDayIndex))
+      ? Number(marketState.lastCloseDayIndex)
+      : null;
+
+  company.dailyReferencePrice = candidate;
+  company.dailyReferenceDayIndex = clock.dayIndex;
+  company.prevClose = candidate; // compatibility field for Roblox
+  company.dailyChangeModelVersion = DAILY_CHANGE_MODEL_VERSION;
+
+  return rebased;
+}
+
+function ensureDailyReferenceForTradingDay(company, clock) {
+  if (!company || !clock) return;
+
+  if (
+    Number(company.dailyChangeModelVersion) !== DAILY_CHANGE_MODEL_VERSION
+    || !(Number(company.dailyReferencePrice) > 0)
+  ) {
+    migrateCompanyDailyReference(company, clock);
+    return;
+  }
+
+  if (
+    clock.dayOfWeekIndex < 5
+    && Number(company.dailyReferenceDayIndex) !== Number(clock.dayIndex)
+  ) {
+    const lastClose = Number(company.lastRegularClosePrice);
+
+    if (lastClose > 0) {
+      company.dailyReferencePrice = lastClose;
+      company.prevClose = lastClose;
+    } else {
+      const currentDisplay = displayedPriceForAsset(company);
+      company.dailyReferencePrice = currentDisplay;
+      company.prevClose = currentDisplay;
+    }
+
+    company.dailyReferenceDayIndex = clock.dayIndex;
+  }
+}
+
 function companyRow(company, clock = marketClock()) {
+  ensureDailyReferenceForTradingDay(company, clock);
+
   const fairPrice = company.companyValue / company.sharesOutstanding;
   const executionReferencePrice = Math.max(
     0.05,
     Number(company.price) || 0.05
   );
   const displayPrice = displayedPriceForAsset(company);
-  const changePct = company.prevClose > 0
-    ? ((displayPrice - company.prevClose) / company.prevClose) * 100
-    : 0;
+  const dailyReference = Math.max(
+    0.00000001,
+    Number(company.dailyReferencePrice)
+      || Number(company.prevClose)
+      || displayPrice
+  );
+  const changePct =
+    ((displayPrice - dailyReference) / dailyReference) * 100;
   const ipoActive = clock.totalMinutes < Number(company.ipoActiveUntil || 0);
 
   return {
@@ -2498,7 +2657,11 @@ function companyRow(company, clock = marketClock()) {
     sharesOutstanding: round(company.sharesOutstanding, 0),
     floatShares: round(company.sharesOutstanding * 0.76, 0),
     publicFloat: round(company.sharesOutstanding * 0.76, 0),
-    prevClose: round(company.prevClose, 4),
+    prevClose: round(dailyReference, 4),
+    dailyReferencePrice: round(dailyReference, 4),
+    lastRegularClosePrice: Number(company.lastRegularClosePrice) > 0
+      ? round(company.lastRegularClosePrice, 4)
+      : null,
     changePct: round(changePct, 2),
     annualGrowth: round(company.annualGrowth * 100, 2),
     volatility: round(company.annualVolatility * 100, 2),
@@ -2830,6 +2993,7 @@ function engineStep() {
 
     ensureStockClassifications(marketState);
     for (const company of Object.values(marketState.companies)) {
+      ensureDailyReferenceForTradingDay(company, clock);
       updateCompany(company, elapsedGameMinutes, clock, factors);
     }
 
@@ -2855,11 +3019,19 @@ function engineStep() {
   // Do not inject random new exchange tickers here.
   marketState.lastIpoWeek = 0;
 
-  // Snapshot regular-session close once per Eastern trading day.
-  if (clock.minuteOfDay >= 960 && clock.dayOfWeekIndex < 5 && Number(marketState.lastCloseDayIndex) !== clock.dayIndex) {
+  // Snapshot the fictional 4 PM regular-session close.
+  // Do NOT reset today's dailyReferencePrice here. The new close becomes the
+  // reference only when the next weekday begins.
+  if (
+    clock.minuteOfDay >= 960
+    && clock.dayOfWeekIndex < 5
+    && Number(marketState.lastCloseDayIndex) !== clock.dayIndex
+  ) {
     for (const company of Object.values(marketState.companies)) {
-      company.prevClose = company.price;
+      company.lastRegularClosePrice = displayedPriceForAsset(company);
+      company.lastRegularCloseDayIndex = clock.dayIndex;
     }
+
     marketState.lastCloseDayIndex = clock.dayIndex;
     queueSave();
   }
