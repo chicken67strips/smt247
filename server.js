@@ -324,7 +324,7 @@ function ensureCryptoCandleSeries(asset, intervalKey) {
   return asset.candles[intervalKey];
 }
 
-function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes = 0) {
+function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes = 0, playerVolume = 0) {
   const candleEntries = Object.entries(asset.candles || {});
   for (const [intervalKey, series] of candleEntries) {
     const spec = FICTIONAL_INTERVALS[intervalKey];
@@ -336,7 +336,8 @@ function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes
     const volume =
       asset.baseVolumePerGameMinute
       * Math.max(0, Number(elapsedGameMinutes) || 0)
-      * (0.60 + Math.random() * 0.80);
+      * (0.60 + Math.random() * 0.80)
+      + Math.max(0, Number(playerVolume) || 0);
 
     if (!current || currentBucket !== bucket) {
       series.push(
@@ -374,13 +375,22 @@ function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes
 function updateSimulatedCrypto(asset, elapsedGameMinutes, clock) {
   if (!(elapsedGameMinutes > 0)) return;
 
+  const priorDisplayedPrice = displayedPriceForAsset(asset);
+  decayPlayerImpact(asset, elapsedGameMinutes);
+
   if (Number(asset.lastDayIndex) !== clock.dayIndex) {
     asset.lastDayIndex = clock.dayIndex;
-    asset.dayOpenPrice = Math.max(0.00000001, Number(asset.price) || asset.initialPrice);
+    asset.dayOpenPrice = Math.max(
+      0.00000001,
+      Number(asset.price) || asset.initialPrice
+    );
     asset.volume24h = 0;
   }
 
-  const prior = Math.max(0.00000001, Number(asset.price) || asset.initialPrice);
+  const prior = Math.max(
+    0.00000001,
+    Number(asset.price) || asset.initialPrice
+  );
 
   const drift =
     asset.annualGrowth * elapsedGameMinutes / (365 * MINUTES_PER_DAY);
@@ -390,9 +400,11 @@ function updateSimulatedCrypto(asset, elapsedGameMinutes, clock) {
     * randomNormal()
     * Math.sqrt(elapsedGameMinutes / (365 * MINUTES_PER_DAY));
 
-  // Very small mean reversion prevents a pure random walk from wandering into
-  // absurd price ranges over long-lived servers while still allowing trends.
-  const reference = Math.max(0.00000001, Number(asset.initialPrice) || prior);
+  const reference = Math.max(
+    0.00000001,
+    Number(asset.initialPrice) || prior
+  );
+
   const referencePull =
     Math.log(reference / prior)
     * clamp(elapsedGameMinutes / (14 * MINUTES_PER_DAY), 0, 0.0015);
@@ -402,12 +414,25 @@ function updateSimulatedCrypto(asset, elapsedGameMinutes, clock) {
     prior * Math.exp(drift + volatility + referencePull)
   );
 
-  updateCryptoCandles(asset, prior, asset.price, clock, elapsedGameMinutes);
+  updateCryptoCandles(
+    asset,
+    priorDisplayedPrice,
+    displayedPriceForAsset(asset),
+    clock,
+    elapsedGameMinutes
+  );
 }
 
 function fictionalCryptoRow(asset) {
-  const price = Math.max(0.00000001, Number(asset.price) || asset.initialPrice);
-  const dayOpen = Math.max(0.00000001, Number(asset.dayOpenPrice) || price);
+  const executionReferencePrice = Math.max(
+    0.00000001,
+    Number(asset.price) || asset.initialPrice
+  );
+  const price = displayedPriceForAsset(asset);
+  const dayOpen = Math.max(
+    0.00000001,
+    Number(asset.dayOpenPrice) || executionReferencePrice
+  );
 
   return {
     symbol: asset.symbol,
@@ -417,6 +442,8 @@ function fictionalCryptoRow(asset) {
     fictional: true,
     simulated: true,
     price: round(price, 8),
+    executionPrice: round(executionReferencePrice, 8),
+    playerImpactPct: round(currentPlayerImpact(asset) * 100, 4),
     change24h: round(((price - dayOpen) / dayOpen) * 100, 4),
     volume24h: round(Math.max(0, Number(asset.volume24h) || 0) * price, 2),
     marketCap: round(price * Math.max(1, Number(asset.totalSupply) || 1), 2),
@@ -732,7 +759,7 @@ function ensureCommodityCandleSeries(asset, intervalKey) {
   return asset.candles[intervalKey];
 }
 
-function updateCommodityCandles(asset, priorPrice, price, clock, elapsedGameMinutes) {
+function updateCommodityCandles(asset, priorPrice, price, clock, elapsedGameMinutes, playerVolume = 0) {
   const candleEntries = Object.entries(asset.candles || {});
   for (const [intervalKey, series] of candleEntries) {
     const spec = FICTIONAL_INTERVALS[intervalKey];
@@ -747,6 +774,7 @@ function updateCommodityCandles(asset, priorPrice, price, clock, elapsedGameMinu
         asset.baseVolumePerGameMinute
         * Math.max(0, Number(elapsedGameMinutes) || 0)
         * (0.65 + Math.random() * 0.70)
+        + Math.max(0, Number(playerVolume) || 0)
       )
     );
 
@@ -781,14 +809,24 @@ function updateCommodityCandles(asset, priorPrice, price, clock, elapsedGameMinu
 
 function updateSimulatedCommodity(asset, elapsedGameMinutes, clock, factors) {
   if (!(elapsedGameMinutes > 0)) return;
+
+  const priorDisplayedPrice = displayedPriceForAsset(asset);
+  decayPlayerImpact(asset, elapsedGameMinutes);
+
   if (commoditySessionForMinute(clock.totalMinutes) !== "open") return;
 
   if (Number(asset.lastDayIndex) !== clock.dayIndex) {
     asset.lastDayIndex = clock.dayIndex;
-    asset.prevClose = Math.max(0.0001, Number(asset.price) || asset.initialPrice);
+    asset.prevClose = Math.max(
+      0.0001,
+      Number(asset.price) || asset.initialPrice
+    );
   }
 
-  const prior = Math.max(0.0001, Number(asset.price) || asset.initialPrice);
+  const prior = Math.max(
+    0.0001,
+    Number(asset.price) || asset.initialPrice
+  );
   const factor = commodityFactorFromRuntime(asset.ticker, factors);
 
   const drift =
@@ -804,12 +842,25 @@ function updateSimulatedCommodity(asset, elapsedGameMinutes, clock, factors) {
     prior * Math.exp(drift + stochastic)
   );
 
-  updateCommodityCandles(asset, prior, asset.price, clock, elapsedGameMinutes);
+  updateCommodityCandles(
+    asset,
+    priorDisplayedPrice,
+    displayedPriceForAsset(asset),
+    clock,
+    elapsedGameMinutes
+  );
 }
 
 function fictionalCommodityRow(asset, clock = marketClock()) {
-  const price = Math.max(0.0001, Number(asset.price) || asset.initialPrice);
-  const prevClose = Math.max(0.0001, Number(asset.prevClose) || price);
+  const executionReferencePrice = Math.max(
+    0.0001,
+    Number(asset.price) || asset.initialPrice
+  );
+  const price = displayedPriceForAsset(asset);
+  const prevClose = Math.max(
+    0.0001,
+    Number(asset.prevClose) || executionReferencePrice
+  );
 
   return {
     ticker: asset.ticker,
@@ -820,6 +871,8 @@ function fictionalCommodityRow(asset, clock = marketClock()) {
     fictional: true,
     simulated: true,
     price: round(price, 6),
+    executionPrice: round(executionReferencePrice, 6),
+    playerImpactPct: round(currentPlayerImpact(asset) * 100, 4),
     prevClose: round(prevClose, 6),
     changePct: round(((price - prevClose) / prevClose) * 100, 3),
     marketState: commoditySessionForMinute(clock.totalMinutes) === "open"
@@ -1560,6 +1613,180 @@ function residentCandleStats() {
   return { series, candles };
 }
 
+// ============================
+// Player trade market impact
+// ============================
+// Player flow moves the displayed quote/chart, but that pressure is temporary.
+// The execution reference remains the underlying simulated price. Therefore a
+// player cannot buy, create their own spike, then immediately dump into that
+// same self-created spike.
+//
+// Impact follows a square-root participation curve. Tiny orders are effectively
+// invisible, large orders are visible, and hard caps prevent memecoin-style
+// vertical pumps even if several players coordinate.
+const PLAYER_IMPACT_FAST_HALF_LIFE_GAME_MINUTES = 4;
+const PLAYER_IMPACT_SLOW_HALF_LIFE_GAME_MINUTES = 30;
+const PLAYER_IMPACT_FAST_WEIGHT = 0.72;
+const PLAYER_IMPACT_SLOW_WEIGHT = 0.28;
+const PLAYER_IMPACT_MIN_VISIBLE = 0.000005; // 0.0005%
+
+function ensurePlayerImpactState(asset) {
+  if (!asset || typeof asset !== "object") return;
+  if (!Number.isFinite(Number(asset.playerImpactFast))) asset.playerImpactFast = 0;
+  if (!Number.isFinite(Number(asset.playerImpactSlow))) asset.playerImpactSlow = 0;
+}
+
+function currentPlayerImpact(asset) {
+  ensurePlayerImpactState(asset);
+  return Number(asset.playerImpactFast || 0) + Number(asset.playerImpactSlow || 0);
+}
+
+function decayPlayerImpact(asset, elapsedGameMinutes) {
+  ensurePlayerImpactState(asset);
+  const elapsed = Math.max(0, Number(elapsedGameMinutes) || 0);
+  if (!(elapsed > 0)) return;
+
+  asset.playerImpactFast *= Math.exp(
+    -Math.LN2 * elapsed / PLAYER_IMPACT_FAST_HALF_LIFE_GAME_MINUTES
+  );
+  asset.playerImpactSlow *= Math.exp(
+    -Math.LN2 * elapsed / PLAYER_IMPACT_SLOW_HALF_LIFE_GAME_MINUTES
+  );
+
+  if (Math.abs(asset.playerImpactFast) < 1e-10) asset.playerImpactFast = 0;
+  if (Math.abs(asset.playerImpactSlow) < 1e-10) asset.playerImpactSlow = 0;
+}
+
+function displayedPriceForAsset(asset) {
+  const base = Math.max(
+    0.00000001,
+    Number(asset?.price ?? asset?.initialPrice) || 0.00000001
+  );
+  return base * Math.exp(currentPlayerImpact(asset));
+}
+
+function playerImpactModel(assetType, asset, clock = marketClock()) {
+  const kind = String(assetType || "").toLowerCase();
+
+  if (kind === "stock") {
+    const marketCap = Math.max(
+      1,
+      Number(asset.price) * Math.max(1, Number(asset.sharesOutstanding) || 1)
+    );
+    const liquidity = clamp(Number(asset.liquidity) || 0.7, 0.05, 1);
+    const volatility = Math.max(0.05, Number(asset.annualVolatility) || 0.30);
+
+    return {
+      liquidityNotional: clamp(
+        Math.sqrt(marketCap) * 1450 * (0.75 + liquidity),
+        3000000,
+        120000000
+      ),
+      coefficient: 0.0046 + volatility * 0.0018 + (1 - liquidity) * 0.0012,
+      maxTradeImpact: clock.session === "open" ? 0.0065 : 0.0085,
+      maxOverlay: 0.0125
+    };
+  }
+
+  if (kind === "crypto") {
+    const marketCap = Math.max(
+      1,
+      Number(asset.price) * Math.max(1, Number(asset.totalSupply) || 1)
+    );
+    const liquidity = clamp(Number(asset.liquidity) || 0.7, 0.05, 1);
+
+    return {
+      liquidityNotional: clamp(
+        Math.sqrt(marketCap) * 1050 * (0.75 + liquidity),
+        2000000,
+        80000000
+      ),
+      coefficient: 0.0062 + (1 - liquidity) * 0.0024,
+      maxTradeImpact: 0.0085,
+      maxOverlay: 0.015
+    };
+  }
+
+  const referencePrice = Math.max(
+    0.0001,
+    Number(asset.price ?? asset.initialPrice) || 1
+  );
+  const baseVolume = Math.max(
+    1,
+    Number(asset.baseVolumePerGameMinute) || 10000
+  );
+
+  return {
+    liquidityNotional: clamp(
+      baseVolume * referencePrice * 2.5,
+      5000000,
+      100000000
+    ),
+    coefficient: 0.0045,
+    maxTradeImpact: 0.0065,
+    maxOverlay: 0.010
+  };
+}
+
+function calculatePlayerTradeImpact(assetType, asset, side, quantity, clock = marketClock()) {
+  const executionReferencePrice = Math.max(
+    0.00000001,
+    Number(asset.price) || Number(asset.initialPrice) || 0.00000001
+  );
+  const qty = Math.max(0, Number(quantity) || 0);
+  const notional = executionReferencePrice * qty;
+  const model = playerImpactModel(assetType, asset, clock);
+
+  if (!(notional > 0) || !(model.liquidityNotional > 0)) {
+    return {
+      executionReferencePrice,
+      notional,
+      requestedImpact: 0,
+      appliedImpact: 0,
+      model
+    };
+  }
+
+  const participation = notional / model.liquidityNotional;
+  let requestedImpact =
+    model.coefficient * Math.sqrt(Math.max(0, participation));
+
+  requestedImpact = clamp(
+    requestedImpact,
+    0,
+    model.maxTradeImpact
+  );
+
+  if (requestedImpact < PLAYER_IMPACT_MIN_VISIBLE) {
+    requestedImpact = 0;
+  }
+
+  const direction = side === "sell" ? -1 : 1;
+  const current = currentPlayerImpact(asset);
+  const target = clamp(
+    current + direction * requestedImpact,
+    -model.maxOverlay,
+    model.maxOverlay
+  );
+
+  return {
+    executionReferencePrice,
+    notional,
+    requestedImpact,
+    appliedImpact: target - current,
+    model
+  };
+}
+
+function applyPlayerTradeImpact(asset, impactInfo) {
+  ensurePlayerImpactState(asset);
+  const applied = Number(impactInfo?.appliedImpact) || 0;
+  if (applied === 0) return;
+  asset.playerImpactFast += applied * PLAYER_IMPACT_FAST_WEIGHT;
+  asset.playerImpactSlow += applied * PLAYER_IMPACT_SLOW_WEIGHT;
+}
+
+
 const INITIAL_COMPANIES = [
   ["ORNG", "Orange Inc.", "Technology", "mega", 310, 185.00, 0.1100, 0.2700, 0.0056, 0.96],
   ["MHRD", "MacroHard Corporation", "Technology", "mega", 430, 418.00, 0.1000, 0.2500, 0.0087, 0.97],
@@ -2241,8 +2468,16 @@ function marketStateName(session) {
 
 function companyRow(company, clock = marketClock()) {
   const fairPrice = company.companyValue / company.sharesOutstanding;
-  const changePct = company.prevClose > 0 ? ((company.price - company.prevClose) / company.prevClose) * 100 : 0;
+  const executionReferencePrice = Math.max(
+    0.05,
+    Number(company.price) || 0.05
+  );
+  const displayPrice = displayedPriceForAsset(company);
+  const changePct = company.prevClose > 0
+    ? ((displayPrice - company.prevClose) / company.prevClose) * 100
+    : 0;
   const ipoActive = clock.totalMinutes < Number(company.ipoActiveUntil || 0);
+
   return {
     ticker: company.ticker,
     companyName: company.name,
@@ -2254,10 +2489,12 @@ function companyRow(company, clock = marketClock()) {
     capGroup: company.capGroup,
     assetType: "fictional-stock",
     fictional: true,
-    price: round(company.price, 4),
+    price: round(displayPrice, 4),
+    executionPrice: round(executionReferencePrice, 4),
+    playerImpactPct: round(currentPlayerImpact(company) * 100, 4),
     fairValue: round(fairPrice, 4),
     companyValue: round(company.companyValue, 2),
-    marketCap: round(company.price * company.sharesOutstanding, 2),
+    marketCap: round(displayPrice * company.sharesOutstanding, 2),
     sharesOutstanding: round(company.sharesOutstanding, 0),
     floatShares: round(company.sharesOutstanding * 0.76, 0),
     publicFloat: round(company.sharesOutstanding * 0.76, 0),
@@ -2265,7 +2502,11 @@ function companyRow(company, clock = marketClock()) {
     changePct: round(changePct, 2),
     annualGrowth: round(company.annualGrowth * 100, 2),
     volatility: round(company.annualVolatility * 100, 2),
-    volatilityBand: company.annualVolatility >= 0.48 ? "High" : company.annualVolatility <= 0.22 ? "Low" : "Medium",
+    volatilityBand: company.annualVolatility >= 0.48
+      ? "High"
+      : company.annualVolatility <= 0.22
+        ? "Low"
+        : "Medium",
     dividendYield: round(company.dividendYield * 100, 2),
     quarterlyDividend: round(company.quarterlyDividend, 4),
     paysDividend: company.dividendYield > 0,
@@ -2401,6 +2642,9 @@ function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elap
 function updateCompany(company, elapsedGameMinutes, clock, factors) {
   if (!(elapsedGameMinutes > 0)) return;
 
+  const priorDisplayedPrice = displayedPriceForAsset(company);
+  decayPlayerImpact(company, elapsedGameMinutes);
+
   const classification = classifyStock(company.ticker, company.sector);
   company.sector = classification.sector;
   company.category = classification.category;
@@ -2417,8 +2661,6 @@ function updateCompany(company, elapsedGameMinutes, clock, factors) {
 
   const sharedFactor = stockFactorFromRuntime(company, factors);
 
-  // Company fundamentals also share some category movement, so correlated price
-  // action is not just a temporary quote-layer effect.
   const valueMove =
     effectiveGrowth * elapsedGameMinutes / (365 * MINUTES_PER_DAY)
     + company.annualVolatility
@@ -2434,6 +2676,7 @@ function updateCompany(company, elapsedGameMinutes, clock, factors) {
   if (!clock.isTradingAllowed) return;
 
   const fairPrice = company.companyValue / company.sharesOutstanding;
+
   const randomMove =
     company.annualVolatility
     * (clock.session === "open" ? 1 : 0.52)
@@ -2444,7 +2687,6 @@ function updateCompany(company, elapsedGameMinutes, clock, factors) {
     ((fairPrice - company.price) / Math.max(company.price, 0.01))
     * clamp(elapsedGameMinutes / 240, 0, 0.22);
 
-  const prior = company.price;
   company.price = Math.max(
     0.05,
     company.price * Math.exp(randomMove + fairPull)
@@ -2452,8 +2694,8 @@ function updateCompany(company, elapsedGameMinutes, clock, factors) {
 
   updateCandles(
     company,
-    prior,
-    company.price,
+    priorDisplayedPrice,
+    displayedPriceForAsset(company),
     clock,
     0,
     elapsedGameMinutes
@@ -2827,6 +3069,11 @@ app.get("/health", (_req, res) => {
     commodityCached: marketState?.commodities ? Object.keys(marketState.commodities).length : 0,
     residentCandleSeries: candleStats.series,
     residentCandles: candleStats.candles,
+    playerImpactModel: {
+      fastHalfLifeGameMinutes: PLAYER_IMPACT_FAST_HALF_LIFE_GAME_MINUTES,
+      slowHalfLifeGameMinutes: PLAYER_IMPACT_SLOW_HALF_LIFE_GAME_MINUTES,
+      minVisiblePct: PLAYER_IMPACT_MIN_VISIBLE * 100
+    },
     candleCacheIdleSeconds: Math.round(CANDLE_CACHE_IDLE_MS / 1000),
     memoryMb: {
       rss: round(memory.rss / 1024 / 1024, 2),
@@ -3147,55 +3394,164 @@ app.get("/fictional/ipo/current", (_req, res) => {
 
 app.post("/fictional/trade", (req, res) => {
   if (!authorizeFictionalTrade(req, res)) return;
+
   if (marketState.handoffReady !== true) {
     return res.status(503).json({
       success: false,
       handoffReady: false,
-      error: "Fictional market is waiting for an exact real-price handoff."
+      error: "Fictional market is not ready."
     });
   }
+
   engineStep();
-  const ticker = normalizeFictionalTicker(req.body?.ticker);
+  ensureStockClassifications(marketState);
+  ensureSimulatedCryptoState(marketState);
+  ensureSimulatedCommodityState(marketState);
+
+  const ticker = String(req.body?.ticker || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+
   const side = String(req.body?.side || "").toLowerCase();
   const quantity = Number(req.body?.quantity);
   const requestId = String(req.body?.requestId || "").slice(0, 160);
-  const company = marketState.companies[ticker];
   const clock = marketClock();
-  if (!company) return res.status(404).json({ success: false, error: "Unknown fictional ticker." });
-  if (side !== "buy" && side !== "sell") return res.status(400).json({ success: false, error: "Side must be buy or sell." });
-  if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1e9) return res.status(400).json({ success: false, error: "Invalid quantity." });
-  if (!clock.isTradingAllowed) return res.status(409).json({ success: false, marketClosed: true, session: clock.session, error: "The fictional stock market is closed." });
-  if (requestId && marketState.tradeReceipts[requestId]) return res.json(marketState.tradeReceipts[requestId]);
 
-  const priorPrice = company.price;
-  const notional = priorPrice * quantity;
-  const liquidityNotional = Math.max(250000, company.companyValue * (0.00005 + company.liquidity * 0.00018));
-  const rawImpact = (notional / liquidityNotional) * (0.0008 + company.annualVolatility * 0.0028);
-  const sessionMultiplier = clock.session === "open" ? 1 : 1.7;
-  const impact = clamp(rawImpact * sessionMultiplier, 0.00001, 0.075);
-  const signedImpact = side === "buy" ? impact : -impact;
-  const spread = (0.00025 + (1 - company.liquidity) * 0.0018) * sessionMultiplier;
-  const executionPrice = priorPrice * (1 + (side === "buy" ? spread / 2 : -spread / 2) + signedImpact / 2);
-  company.price = Math.max(0.05, priorPrice * (1 + signedImpact));
-  if (side === "buy") company.buyVolume += quantity; else company.sellVolume += quantity;
-  updateCandles(company, priorPrice, company.price, clock, quantity, 0);
+  if (side !== "buy" && side !== "sell") {
+    return res.status(400).json({ success: false, error: "Side must be buy or sell." });
+  }
+
+  if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1e9) {
+    return res.status(400).json({ success: false, error: "Invalid quantity." });
+  }
+
+  if (requestId && marketState.tradeReceipts[requestId]) {
+    return res.json(marketState.tradeReceipts[requestId]);
+  }
+
+  let assetType = "";
+  let asset = null;
+
+  if (marketState.companies[ticker]) {
+    assetType = "stock";
+    asset = marketState.companies[ticker];
+
+    if (!clock.isTradingAllowed) {
+      return res.status(409).json({
+        success: false,
+        marketClosed: true,
+        session: clock.session,
+        error: "The fictional stock market is closed."
+      });
+    }
+  } else if (marketState.cryptos[ticker]) {
+    assetType = "crypto";
+    asset = marketState.cryptos[ticker];
+  } else if (marketState.commodities[ticker]) {
+    assetType = "commodity";
+    asset = marketState.commodities[ticker];
+
+    if (commoditySessionForMinute(clock.totalMinutes) !== "open") {
+      return res.status(409).json({
+        success: false,
+        marketClosed: true,
+        session: "commodity-closed",
+        error: "The fictional commodity market is closed."
+      });
+    }
+  } else {
+    return res.status(404).json({ success: false, error: "Unknown fictional asset." });
+  }
+
+  const priorDisplayPrice = displayedPriceForAsset(asset);
+  const impactInfo = calculatePlayerTradeImpact(
+    assetType,
+    asset,
+    side,
+    quantity,
+    clock
+  );
+
+  applyPlayerTradeImpact(asset, impactInfo);
+
+  const newDisplayPrice = displayedPriceForAsset(asset);
+
+  if (assetType === "stock") {
+    if (side === "buy") asset.buyVolume += quantity;
+    else asset.sellVolume += quantity;
+
+    updateCandles(
+      asset,
+      priorDisplayPrice,
+      newDisplayPrice,
+      clock,
+      quantity,
+      0
+    );
+  } else if (assetType === "crypto") {
+    updateCryptoCandles(
+      asset,
+      priorDisplayPrice,
+      newDisplayPrice,
+      clock,
+      0,
+      quantity
+    );
+  } else {
+    updateCommodityCandles(
+      asset,
+      priorDisplayPrice,
+      newDisplayPrice,
+      clock,
+      0,
+      quantity
+    );
+  }
+
+  const market =
+    assetType === "stock"
+      ? companyRow(asset, clock)
+      : assetType === "crypto"
+        ? fictionalCryptoRow(asset)
+        : fictionalCommodityRow(asset, clock);
+
+  const decimals = assetType === "stock" ? 4 : 8;
+
   const result = {
-    success: true, requestId, ticker, side, quantity,
-    executionPrice: round(executionPrice, 4),
-    priorPrice: round(priorPrice, 4),
-    newPrice: round(company.price, 4),
-    impactPct: round(signedImpact * 100, 4),
-    session: clock.session,
-    market: companyRow(company, clock)
+    success: true,
+    requestId,
+    ticker,
+    assetType,
+    side,
+    quantity,
+    notional: round(impactInfo.notional, 2),
+    executionPrice: round(impactInfo.executionReferencePrice, decimals),
+    priorPrice: round(priorDisplayPrice, decimals),
+    newPrice: round(newDisplayPrice, decimals),
+    impactPct: round(impactInfo.appliedImpact * 100, 4),
+    requestedImpactPct: round(impactInfo.requestedImpact * 100, 4),
+    totalPlayerImpactPct: round(currentPlayerImpact(asset) * 100, 4),
+    simulatedLiquidityNotional: round(impactInfo.model.liquidityNotional, 2),
+    maxOverlayPct: round(impactInfo.model.maxOverlay * 100, 3),
+    temporaryImpact: true,
+    antiPumpAndDump: true,
+    market
   };
+
   if (requestId) {
     marketState.tradeReceipts[requestId] = result;
     const ids = Object.keys(marketState.tradeReceipts);
-    if (ids.length > 600) for (const id of ids.slice(0, ids.length - 500)) delete marketState.tradeReceipts[id];
+    if (ids.length > 600) {
+      for (const id of ids.slice(0, ids.length - 500)) {
+        delete marketState.tradeReceipts[id];
+      }
+    }
   }
+
   queueSave();
   res.json(result);
 });
+
 
 app.get("/group-role/status", async (req, res) => {
   if (!groupAuthorized(req)) return res.status(401).json({ ok: false, error: "Unauthorized." });
