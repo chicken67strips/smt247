@@ -8,6 +8,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const app = express();
+app.disable("x-powered-by");
 const PORT = Number(process.env.PORT) || 8080;
 app.use(express.json({ limit: "25kb" }));
 
@@ -239,30 +240,22 @@ function makeFictionalCryptoCandle(bucketMinute, open, high, low, close, volume)
   const v = Math.max(0, Math.round(Number(volume) || 0));
 
   return {
+    // Compact internal/API representation. Roblox already accepts the short
+    // OHLCV keys and can derive the day name from gameDayIndex.
     t: safeBucket * 60,
-    ts: safeBucket * 60,
-    time: safeBucket * 60,
-    timestamp: safeBucket * 60,
     bucketMinute: safeBucket,
-    datetime: `${DAY_NAMES[dayOfWeekIndex]} ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
     o, h, l, c, v,
-    open: o,
-    high: h,
-    low: l,
-    close: c,
-    volume: v,
     session: "crypto",
-    fictional: true,
-    assetType: "crypto",
     gameDayIndex: dayIndex,
-    gameDayName: DAY_NAMES[dayOfWeekIndex],
     gameMinuteOfDay: minuteOfDay
   };
 }
 
 function ensureCryptoCandleSeries(asset, intervalKey) {
   asset.candles = asset.candles || {};
+
   if (Array.isArray(asset.candles[intervalKey]) && asset.candles[intervalKey].length) {
+    touchCandleSeries("crypto", asset.symbol, intervalKey);
     return asset.candles[intervalKey];
   }
 
@@ -273,7 +266,7 @@ function ensureCryptoCandleSeries(asset, intervalKey) {
   const buckets = [];
   let cursor = Math.floor(nowMinute / spec.minutes) * spec.minutes;
 
-  while (buckets.length < 220) {
+  while (buckets.length < spec.limit) {
     buckets.push(cursor);
     cursor -= spec.minutes;
   }
@@ -293,14 +286,14 @@ function ensureCryptoCandleSeries(asset, intervalKey) {
 
     price = Math.max(
       0.00000001,
-      open * Math.exp(drift + randomNormal() * sigma)
+      open * Math.exp(drift + seededNormal(`crypto:${asset.symbol}:${bucket}`) * sigma)
     );
 
-    const wickSize = Math.abs(randomNormal()) * sigma * open * 0.55;
+    const wickSize = Math.abs(seededNormal(`crypto-wick:${asset.symbol}:${bucket}`)) * sigma * open * 0.55;
     const volume =
       asset.baseVolumePerGameMinute
       * elapsedMinutes
-      * (0.55 + Math.random() * 0.90);
+      * (0.55 + seededUnit(`crypto-volume:${asset.symbol}:${bucket}`) * 0.90);
 
     series.push(
       makeFictionalCryptoCandle(
@@ -315,24 +308,27 @@ function ensureCryptoCandleSeries(asset, intervalKey) {
   }
 
   if (series.length) {
-    const lastClose = Number(series[series.length - 1].close) || asset.price;
+    const lastClose = Number(series[series.length - 1].c) || asset.price;
     const ratio = lastClose > 0 ? asset.price / lastClose : 1;
 
     for (const candle of series) {
-      candle.open = candle.o = round(candle.open * ratio, 8);
-      candle.high = candle.h = round(candle.high * ratio, 8);
-      candle.low = candle.l = round(Math.max(0.00000001, candle.low * ratio), 8);
-      candle.close = candle.c = round(candle.close * ratio, 8);
+      candle.o = round(candle.o * ratio, 8);
+      candle.h = round(candle.h * ratio, 8);
+      candle.l = round(Math.max(0.00000001, candle.l * ratio), 8);
+      candle.c = round(candle.c * ratio, 8);
     }
   }
 
   asset.candles[intervalKey] = series.slice(-spec.limit);
+  touchCandleSeries("crypto", asset.symbol, intervalKey);
   return asset.candles[intervalKey];
 }
 
 function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes = 0) {
-  for (const [intervalKey, spec] of Object.entries(FICTIONAL_INTERVALS)) {
-    const series = ensureCryptoCandleSeries(asset, intervalKey);
+  const candleEntries = Object.entries(asset.candles || {});
+  for (const [intervalKey, series] of candleEntries) {
+    const spec = FICTIONAL_INTERVALS[intervalKey];
+    if (!spec || !Array.isArray(series) || series.length === 0) continue;
     const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
     const current = series[series.length - 1];
     const currentBucket = current ? Number(current.bucketMinute) : null;
@@ -357,13 +353,13 @@ function updateCryptoCandles(asset, priorPrice, price, clock, elapsedGameMinutes
         series.splice(0, series.length - spec.limit);
       }
     } else {
-      current.high = current.h = round(Math.max(Number(current.high) || price, price), 8);
-      current.low = current.l = round(
-        Math.max(0.00000001, Math.min(Number(current.low) || price, price)),
+      current.h = round(Math.max(Number(current.h) || price, price), 8);
+      current.l = round(
+        Math.max(0.00000001, Math.min(Number(current.l) || price, price)),
         8
       );
-      current.close = current.c = round(price, 8);
-      current.volume = current.v = Math.round((Number(current.volume) || 0) + volume);
+      current.c = round(price, 8);
+      current.v = Math.round((Number(current.v) || 0) + volume);
       current.session = "crypto";
       current.fictional = true;
       current.assetType = "crypto";
@@ -496,129 +492,416 @@ async function getCryptoCandles(symbol, interval) {
 }
 
 // ============================
-// Real commodities
+// Fully fictional commodities
 // ============================
-const COMMODITIES = {
-  GOLD: { yahoo: "GC=F", name: "Gold Spot", unit: "per troy oz", min: 100, max: 10000 },
-  SILVER: { yahoo: "SI=F", name: "Silver Spot", unit: "per troy oz", min: 1, max: 1000 },
-  OIL: { yahoo: "CL=F", name: "WTI Crude Oil", unit: "per barrel", min: 1, max: 1000 }
-};
-const commodityPriceCache = {};
-const commodityCandleCache = new Map();
-const COMMODITY_PRICE_TTL_MS = 10000;
-const COMMODITY_CANDLE_TTL_MS = 15000;
+// GOLD, SILVER, and OIL are simulated entirely inside this backend.
+// No Yahoo/Twelve Data/other real commodity price or candle data is used.
+//
+// Gold and silver intentionally share a strong metals factor. Stock-category
+// factors can also feed into commodity movement. In particular, positive
+// Electronics & Semiconductors movement lifts both metals, with SILVER receiving
+// the larger sensitivity because industrial/electronics demand matters more to it.
+const COMMODITY_SYMBOLS = ["GOLD", "SILVER", "OIL"];
+
+const FICTIONAL_COMMODITY_SEEDS = [
+  {
+    ticker: "GOLD",
+    name: "Gold",
+    unit: "per troy oz",
+    initialPrice: 1875.40,
+    annualGrowth: 0.040,
+    annualVolatility: 0.18,
+    baseVolumePerGameMinute: 18500
+  },
+  {
+    ticker: "SILVER",
+    name: "Silver",
+    unit: "per troy oz",
+    initialPrice: 28.65,
+    annualGrowth: 0.055,
+    annualVolatility: 0.34,
+    baseVolumePerGameMinute: 42000
+  },
+  {
+    ticker: "OIL",
+    name: "Crude Oil",
+    unit: "per barrel",
+    initialPrice: 83.25,
+    annualGrowth: 0.025,
+    annualVolatility: 0.42,
+    baseVolumePerGameMinute: 65000
+  }
+];
 
 function normalizeCommodityTicker(value) {
   const ticker = String(value || "").toUpperCase().replace(/[^A-Z]/g, "");
-  return COMMODITIES[ticker] ? ticker : "";
+  return COMMODITY_SYMBOLS.includes(ticker) ? ticker : "";
 }
 
-function validCommodityPrice(ticker, value) {
-  const definition = COMMODITIES[ticker];
-  const price = Number(value);
-  return Boolean(definition && Number.isFinite(price) && price >= definition.min && price <= definition.max);
-}
-
-async function fetchYahooChart(yahooSymbol, range, interval) {
-  let lastError = null;
-  for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
-    try {
-      const response = await fetchJson(
-        `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSymbol)}?range=${encodeURIComponent(range)}&interval=${encodeURIComponent(interval)}&includePrePost=true&events=div%2Csplits&_=${Date.now()}`,
-        { headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" } },
-        8500
-      );
-      const chart = response.data && response.data.chart;
-      const result = chart && Array.isArray(chart.result) && chart.result[0];
-      if (!response.ok || !result) throw new Error(chart?.error?.description || `Yahoo HTTP ${response.status}`);
-      return result;
-    } catch (error) { lastError = error; }
-  }
-  throw lastError || new Error("Yahoo request failed.");
-}
-
-async function refreshCommodityTicker(ticker, force = false) {
-  const cached = commodityPriceCache[ticker];
-  if (!force && cached && Date.now() - cached.receivedAtMs < COMMODITY_PRICE_TTL_MS) return cached;
-  const definition = COMMODITIES[ticker];
-  try {
-    const result = await fetchYahooChart(definition.yahoo, "1d", "1m");
-    const meta = result.meta || {};
-    const quote = result.indicators?.quote?.[0] || {};
-    const closes = Array.isArray(quote.close) ? quote.close.filter(value => validCommodityPrice(ticker, value)) : [];
-    const price = asNumber(meta.regularMarketPrice) || closes[closes.length - 1];
-    if (!validCommodityPrice(ticker, price)) throw new Error("Yahoo returned an invalid commodity price.");
-    const prevClose = asNumber(meta.previousClose) || asNumber(meta.chartPreviousClose) || price;
-    const changePct = prevClose > 0 ? ((price - prevClose) / prevClose) * 100 : 0;
-    commodityPriceCache[ticker] = {
-      ticker,
-      name: definition.name,
-      assetType: "commodity",
-      price: round(price, 6),
-      prevClose: round(prevClose, 6),
-      changePct: round(changePct, 2),
-      unit: definition.unit,
-      source: "Yahoo Finance commodity futures",
-      lastUpdated: asNumber(meta.regularMarketTime) || Math.floor(Date.now() / 1000),
-      receivedAtMs: Date.now()
-    };
-    return commodityPriceCache[ticker];
-  } catch (error) {
-    if (cached) return { ...cached, stale: true, providerError: error.message };
-    throw error;
-  }
-}
-
-async function getCommodityCandles(ticker, requestedInterval) {
-  const intervals = {
-    "1m": { yahoo: "1m", range: "5d" },
-    "5m": { yahoo: "5m", range: "5d" },
-    "15m": { yahoo: "15m", range: "1mo" },
-    "30m": { yahoo: "30m", range: "1mo" },
-    "1h": { yahoo: "60m", range: "3mo" },
-    "1d": { yahoo: "1d", range: "2y" }
+function makeFictionalCommodityFromSeed(seed) {
+  const price = Math.max(0.0001, Number(seed.initialPrice) || 1);
+  return {
+    ticker: seed.ticker,
+    name: seed.name,
+    unit: seed.unit,
+    initialPrice: price,
+    price,
+    prevClose: price,
+    annualGrowth: Number(seed.annualGrowth) || 0,
+    annualVolatility: Math.max(0.01, Number(seed.annualVolatility) || 0.25),
+    baseVolumePerGameMinute: Math.max(1, Number(seed.baseVolumePerGameMinute) || 10000),
+    lastDayIndex: null,
+    candles: {}
   };
-  const config = intervals[requestedInterval];
-  if (!config) return { ticker, interval: requestedInterval, error: "Unsupported commodity interval." };
-  const key = `${ticker}:${requestedInterval}`;
-  const cached = commodityCandleCache.get(key);
-  if (cached && Date.now() - cached.at < COMMODITY_CANDLE_TTL_MS) return { ...cached.data, cached: true };
-  try {
-    const result = await fetchYahooChart(COMMODITIES[ticker].yahoo, config.range, config.yahoo);
-    const timestamps = Array.isArray(result.timestamp) ? result.timestamp : [];
-    const quote = result.indicators?.quote?.[0] || {};
-    const candles = [];
-    for (let index = 0; index < timestamps.length; index += 1) {
-      const o = asNumber(quote.open?.[index]);
-      const h = asNumber(quote.high?.[index]);
-      const l = asNumber(quote.low?.[index]);
-      const c = asNumber(quote.close?.[index]);
-      if (![o, h, l, c].every(value => validCommodityPrice(ticker, value))) continue;
-      candles.push(makeRealCandle(Number(timestamps[index]), o, h, l, c, asNumber(quote.volume?.[index]) || 0, "commodity"));
-    }
-    if (!candles.length) throw new Error("Yahoo returned no usable commodity candles.");
-    const data = {
-      success: true,
-      ticker,
-      interval: requestedInterval,
-      candles: withRsi(candles.slice(-500)),
-      commodity: true,
-      assetType: "commodity",
-      source: "Yahoo Finance commodity futures",
-      extendedHoursIncluded: true,
-      indicators: { rsiPeriod: 14, rsiSource: "candle-close" }
-    };
-    commodityCandleCache.set(key, { at: Date.now(), data });
-    return data;
-  } catch (error) {
-    if (cached) return { ...cached.data, cached: true, stale: true };
-    return { ticker, interval: requestedInterval, commodity: true, error: error.message };
+}
+
+function buildInitialSimulatedCommodityMap() {
+  const output = {};
+  for (const seed of FICTIONAL_COMMODITY_SEEDS) {
+    output[seed.ticker] = makeFictionalCommodityFromSeed(seed);
   }
+  return output;
+}
+
+function ensureSimulatedCommodityState(state) {
+  if (!state || typeof state !== "object") return;
+
+  if (!state.commodities || typeof state.commodities !== "object" || Array.isArray(state.commodities)) {
+    state.commodities = {};
+  }
+
+  for (const seed of FICTIONAL_COMMODITY_SEEDS) {
+    let asset = state.commodities[seed.ticker];
+    if (!asset || typeof asset !== "object") {
+      asset = makeFictionalCommodityFromSeed(seed);
+      state.commodities[seed.ticker] = asset;
+    }
+
+    asset.ticker = seed.ticker;
+    asset.name = seed.name;
+    asset.unit = seed.unit;
+
+    if (!(asNumber(asset.initialPrice) > 0)) asset.initialPrice = seed.initialPrice;
+    if (!(asNumber(asset.price) > 0)) asset.price = seed.initialPrice;
+    if (!(asNumber(asset.prevClose) > 0)) asset.prevClose = asset.price;
+
+    asset.annualGrowth = Number(seed.annualGrowth) || 0;
+    asset.annualVolatility = Math.max(0.01, Number(seed.annualVolatility) || 0.25);
+    asset.baseVolumePerGameMinute = Math.max(1, Number(seed.baseVolumePerGameMinute) || 10000);
+    asset.lastDayIndex = Number.isFinite(Number(asset.lastDayIndex))
+      ? Number(asset.lastDayIndex)
+      : null;
+    asset.candles = asset.candles && typeof asset.candles === "object"
+      ? asset.candles
+      : {};
+  }
+
+  for (const ticker of Object.keys(state.commodities)) {
+    if (!COMMODITY_SYMBOLS.includes(ticker)) {
+      delete state.commodities[ticker];
+    }
+  }
+}
+
+// Fictional commodity schedule modeled after a realistic futures schedule:
+// Sunday 6 PM through Friday 5 PM, with a 5-6 PM maintenance break Mon-Thu.
+// dayOfWeekIndex: Monday=0 ... Sunday=6.
+function commoditySessionForMinute(totalMinute) {
+  const safeMinute = Math.max(0, Math.floor(Number(totalMinute) || 0));
+  const dayIndex = Math.floor(safeMinute / MINUTES_PER_DAY);
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay = ((safeMinute % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+
+  if (dayOfWeekIndex === 5) return "closed"; // Saturday
+  if (dayOfWeekIndex === 6) return minuteOfDay >= 1080 ? "open" : "closed"; // Sunday after 6 PM
+  if (dayOfWeekIndex === 4) return minuteOfDay < 1020 ? "open" : "closed"; // Friday before 5 PM
+
+  // Monday-Thursday: open until 5 PM, maintenance 5-6 PM, then reopen.
+  return (minuteOfDay < 1020 || minuteOfDay >= 1080) ? "open" : "closed";
+}
+
+function makeFictionalCommodityCandle(bucketMinute, open, high, low, close, volume) {
+  const safeBucket = Math.max(0, Math.floor(Number(bucketMinute) || 0));
+  const dayIndex = Math.floor(safeBucket / MINUTES_PER_DAY);
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay = ((safeBucket % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
+  const hour = Math.floor(minuteOfDay / 60);
+  const minute = minuteOfDay % 60;
+
+  const o = round(Math.max(0.0001, Number(open) || 0), 6);
+  const c = round(Math.max(0.0001, Number(close) || o), 6);
+  const h = round(Math.max(o, c, Number(high) || o), 6);
+  const l = round(Math.max(0.0001, Math.min(o, c, Number(low) || o)), 6);
+  const v = Math.max(0, Math.round(Number(volume) || 0));
+
+  return {
+    t: safeBucket * 60,
+    bucketMinute: safeBucket,
+    o, h, l, c, v,
+    session: "commodity",
+    gameDayIndex: dayIndex,
+    gameMinuteOfDay: minuteOfDay
+  };
+}
+
+function ensureCommodityCandleSeries(asset, intervalKey) {
+  asset.candles = asset.candles || {};
+
+  if (Array.isArray(asset.candles[intervalKey]) && asset.candles[intervalKey].length) {
+    touchCandleSeries("commodity", asset.ticker, intervalKey);
+    return asset.candles[intervalKey];
+  }
+
+  const spec = FICTIONAL_INTERVALS[intervalKey];
+  if (!spec) return [];
+
+  const nowMinute = marketClock().totalMinutes;
+  const buckets = [];
+  let cursor = Math.floor(nowMinute / spec.minutes) * spec.minutes;
+  let safety = 0;
+
+  while (buckets.length < spec.limit && safety < 60000) {
+    const dayIndex = Math.floor(cursor / MINUTES_PER_DAY);
+    const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+
+    if (intervalKey === "1d") {
+      if (dayOfWeekIndex < 5) buckets.push(cursor);
+    } else if (commoditySessionForMinute(cursor) === "open") {
+      buckets.push(cursor);
+    }
+
+    cursor -= spec.minutes;
+    safety += 1;
+  }
+
+  buckets.reverse();
+
+  const series = [];
+  let price = Math.max(0.0001, Number(asset.initialPrice || asset.price) || 1);
+
+  for (const bucket of buckets) {
+    const open = price;
+    const elapsedMinutes = spec.minutes;
+    const drift =
+      asset.annualGrowth * elapsedMinutes / (365 * MINUTES_PER_DAY);
+
+    const factor = historicalCommodityFactor(asset.ticker, bucket);
+    const sigma =
+      asset.annualVolatility * Math.sqrt(elapsedMinutes / (365 * MINUTES_PER_DAY));
+
+    price = Math.max(
+      0.0001,
+      open * Math.exp(drift + sigma * factor)
+    );
+
+    const wick =
+      Math.abs(seededNormal(`commodity-wick:${asset.ticker}:${bucket}`))
+      * sigma * open * 0.55;
+
+    const volume =
+      asset.baseVolumePerGameMinute
+      * elapsedMinutes
+      * (0.55 + seededUnit(`commodity-volume:${asset.ticker}:${bucket}`) * 0.90);
+
+    series.push(
+      makeFictionalCommodityCandle(
+        bucket,
+        open,
+        Math.max(open, price) + wick,
+        Math.max(0.0001, Math.min(open, price) - wick),
+        price,
+        volume
+      )
+    );
+  }
+
+  if (series.length) {
+    const latest = Number(series[series.length - 1].c) || asset.price;
+    const ratio = latest > 0 ? asset.price / latest : 1;
+
+    for (const candle of series) {
+      candle.o = round(candle.o * ratio, 6);
+      candle.h = round(candle.h * ratio, 6);
+      candle.l = round(Math.max(0.0001, candle.l * ratio), 6);
+      candle.c = round(candle.c * ratio, 6);
+    }
+  }
+
+  asset.candles[intervalKey] = series.slice(-spec.limit);
+  touchCandleSeries("commodity", asset.ticker, intervalKey);
+  return asset.candles[intervalKey];
+}
+
+function updateCommodityCandles(asset, priorPrice, price, clock, elapsedGameMinutes) {
+  const candleEntries = Object.entries(asset.candles || {});
+  for (const [intervalKey, series] of candleEntries) {
+    const spec = FICTIONAL_INTERVALS[intervalKey];
+    if (!spec || !Array.isArray(series) || series.length === 0) continue;
+    const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
+    const current = series[series.length - 1];
+    const currentBucket = current ? Number(current.bucketMinute) : null;
+
+    const volume = Math.max(
+      1,
+      Math.round(
+        asset.baseVolumePerGameMinute
+        * Math.max(0, Number(elapsedGameMinutes) || 0)
+        * (0.65 + Math.random() * 0.70)
+      )
+    );
+
+    if (!current || currentBucket !== bucket) {
+      series.push(
+        makeFictionalCommodityCandle(
+          bucket,
+          priorPrice,
+          Math.max(priorPrice, price),
+          Math.min(priorPrice, price),
+          price,
+          volume
+        )
+      );
+      if (series.length > spec.limit) {
+        series.splice(0, series.length - spec.limit);
+      }
+    } else {
+      current.h = round(Math.max(Number(current.h) || price, price), 6);
+      current.l = round(
+        Math.max(0.0001, Math.min(Number(current.l) || price, price)),
+        6
+      );
+      current.c = round(price, 6);
+      current.v = Math.round((Number(current.v) || 0) + volume);
+      current.session = "commodity";
+      current.fictional = true;
+      current.simulated = true;
+    }
+  }
+}
+
+function updateSimulatedCommodity(asset, elapsedGameMinutes, clock, factors) {
+  if (!(elapsedGameMinutes > 0)) return;
+  if (commoditySessionForMinute(clock.totalMinutes) !== "open") return;
+
+  if (Number(asset.lastDayIndex) !== clock.dayIndex) {
+    asset.lastDayIndex = clock.dayIndex;
+    asset.prevClose = Math.max(0.0001, Number(asset.price) || asset.initialPrice);
+  }
+
+  const prior = Math.max(0.0001, Number(asset.price) || asset.initialPrice);
+  const factor = commodityFactorFromRuntime(asset.ticker, factors);
+
+  const drift =
+    asset.annualGrowth * elapsedGameMinutes / (365 * MINUTES_PER_DAY);
+
+  const stochastic =
+    asset.annualVolatility
+    * factor
+    * Math.sqrt(elapsedGameMinutes / (365 * MINUTES_PER_DAY));
+
+  asset.price = Math.max(
+    0.0001,
+    prior * Math.exp(drift + stochastic)
+  );
+
+  updateCommodityCandles(asset, prior, asset.price, clock, elapsedGameMinutes);
+}
+
+function fictionalCommodityRow(asset, clock = marketClock()) {
+  const price = Math.max(0.0001, Number(asset.price) || asset.initialPrice);
+  const prevClose = Math.max(0.0001, Number(asset.prevClose) || price);
+
+  return {
+    ticker: asset.ticker,
+    symbol: asset.ticker,
+    name: asset.name,
+    unit: asset.unit,
+    assetType: "commodity",
+    fictional: true,
+    simulated: true,
+    price: round(price, 6),
+    prevClose: round(prevClose, 6),
+    changePct: round(((price - prevClose) / prevClose) * 100, 3),
+    marketState: commoditySessionForMinute(clock.totalMinutes) === "open"
+      ? "OPEN"
+      : "CLOSED",
+    session: "commodity",
+    source: "Godly Capital fictional commodity simulation",
+    lastUpdated: Math.floor(Date.now() / 1000)
+  };
+}
+
+async function getCommodityPrices() {
+  engineStep();
+  ensureSimulatedCommodityState(marketState);
+
+  const prices = {};
+  const clock = marketClock();
+
+  for (const ticker of COMMODITY_SYMBOLS) {
+    const asset = marketState.commodities[ticker];
+    if (asset) prices[ticker] = fictionalCommodityRow(asset, clock);
+  }
+
+  return {
+    success: true,
+    fictional: true,
+    simulated: true,
+    externalCommodityDataUsed: false,
+    prices,
+    source: "Godly Capital fictional commodity simulation",
+    updatedAt: Math.floor(Date.now() / 1000)
+  };
+}
+
+async function getCommodityCandles(ticker, interval) {
+  engineStep();
+  ensureSimulatedCommodityState(marketState);
+
+  const asset = marketState.commodities[ticker];
+  if (!asset) {
+    return {
+      ticker,
+      interval,
+      fictional: true,
+      error: "Unknown fictional commodity."
+    };
+  }
+
+  if (!FICTIONAL_INTERVALS[interval]) {
+    return {
+      ticker,
+      interval,
+      fictional: true,
+      error: "Unsupported commodity interval."
+    };
+  }
+
+  return {
+    success: true,
+    ticker,
+    name: asset.name,
+    interval,
+    commodity: true,
+    fictional: true,
+    simulated: true,
+    assetType: "commodity",
+    source: "Godly Capital fictional commodity simulation",
+    livePriceCompatible: true,
+    candles: withRsi(ensureCommodityCandleSeries(asset, interval)),
+    indicators: {
+      rsiPeriod: 14,
+      rsiSource: "candle-close"
+    }
+  };
 }
 
 // ============================
 // Fictional stock exchange - MAIN GAME CATALOG
 // ============================
+// Stock prices/candles/news are fully simulated after the one-time handoff.
+// Crypto and commodities are also fully simulated and use no real-world
+// crypto/commodity market feeds.
 // Stock prices/candles/news are fully simulated and are not derived from real-stock feeds.
 // Crypto and commodities remain on their existing real-data code paths above.
 const MINUTES_PER_DAY = 1440;
@@ -699,6 +982,480 @@ const HANDOFF_REAL_TICKERS = {
   CLPR: "CLPR"
 };
 
+
+// ============================
+// Stock classifications / hierarchical shared-factor model
+// ============================
+// Hierarchy:
+//   Sector -> Category -> Subcategory
+//
+// "Industry" is a parallel business/production factor. It exists because a stock
+// can belong to a thematic category such as Artificial Intelligence while still
+// being physically exposed to semiconductors/electronics. Commodity coupling uses
+// INDUSTRY factors, so AI semiconductor strength can still push SILVER/GOLD.
+//
+// Example:
+//   MVDO (NVDA counterpart)
+//   Sector      = Information Technology
+//   Category    = Artificial Intelligence
+//   Subcategory = AI Semiconductors
+//   Industry    = Electronics & Semiconductors
+//
+// This prevents the AI category from erasing the economically important
+// semiconductor/electronics relationship.
+const STOCK_CLASSIFICATION = {
+  ORNG: { sector: "Information Technology", category: "Consumer Technology", subcategory: "Consumer Electronics", industry: "Electronics & Semiconductors" },
+  MHRD: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Platforms & Cloud", industry: "Software & Cloud" },
+  MVDO: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Semiconductors", industry: "Electronics & Semiconductors" },
+  AMZG: { sector: "Consumer Discretionary", category: "E-Commerce & Retail", subcategory: "E-Commerce Platforms", industry: "Consumer Discretionary" },
+  ELPHT: { sector: "Communication Services", category: "Artificial Intelligence", subcategory: "AI Platforms & Cloud", industry: "Internet & Digital Media" },
+  DATA: { sector: "Communication Services", category: "Artificial Intelligence", subcategory: "AI Platforms & Models", industry: "Internet & Digital Media" },
+  NKLA: { sector: "Consumer Discretionary", category: "Automotive", subcategory: "Electric Vehicles", industry: "Automotive" },
+  SKYX: { sector: "Industrials", category: "Aerospace & Defense", subcategory: "Space & Launch", industry: "Aerospace & Defense" },
+  BKSG: { sector: "Financials", category: "Financial Services", subcategory: "Diversified Holdings", industry: "Financial Services" },
+  HCC: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Semiconductors", industry: "Electronics & Semiconductors" },
+  ELLY: { sector: "Health Care", category: "Healthcare & Biotech", subcategory: "Pharmaceuticals", industry: "Healthcare & Biotech" },
+  PMK: { sector: "Financials", category: "Financial Services", subcategory: "Banking", industry: "Financial Services" },
+  M: { sector: "Financials", category: "Financial Services", subcategory: "Payments", industry: "Financial Services" },
+  FMT: { sector: "Consumer Staples", category: "Consumer Staples", subcategory: "Discount Retail", industry: "Consumer Staples" },
+  DVS: { sector: "Health Care", category: "Healthcare & Biotech", subcategory: "Health Insurance", industry: "Healthcare & Biotech" },
+  WXM: { sector: "Energy", category: "Energy", subcategory: "Integrated Oil & Gas", industry: "Energy" },
+  ABMD: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Semiconductors", industry: "Electronics & Semiconductors" },
+  NFKS: { sector: "Communication Services", category: "Entertainment & Media", subcategory: "Streaming", industry: "Internet & Digital Media" },
+  BUM: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Enterprise Software", industry: "Software & Cloud" },
+  DGBE: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Creative Software", industry: "Software & Cloud" },
+  REVL: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Platforms & Cloud", industry: "Software & Cloud" },
+  MNEY: { sector: "Consumer Staples", category: "Consumer Staples", subcategory: "Warehouse Retail", industry: "Consumer Staples" },
+  VKNEE: { sector: "Communication Services", category: "Entertainment & Media", subcategory: "Diversified Entertainment", industry: "Internet & Digital Media" },
+  BEAR: { sector: "Industrials", category: "Aerospace & Defense", subcategory: "Commercial Aerospace", industry: "Aerospace & Defense" },
+  NICY: { sector: "Consumer Discretionary", category: "Consumer Discretionary", subcategory: "Apparel & Footwear", industry: "Consumer Discretionary" },
+  PPL: { sector: "Financials", category: "Financial Services", subcategory: "Digital Payments", industry: "Financial Services" },
+  INFO: { sector: "Information Technology", category: "Electronics & Semiconductors", subcategory: "Semiconductors", industry: "Electronics & Semiconductors" },
+  OVER: { sector: "Industrials", category: "Transportation & Travel", subcategory: "Mobility Platforms", industry: "Transportation & Travel" },
+  WBAB: { sector: "Consumer Discretionary", category: "Transportation & Travel", subcategory: "Lodging Platforms", industry: "Transportation & Travel" },
+  SMNY: { sector: "Consumer Discretionary", category: "Consumer Discretionary", subcategory: "Restaurants & Coffee", industry: "Consumer Discretionary" },
+  BC: { sector: "Consumer Staples", category: "Consumer Staples", subcategory: "Beverages", industry: "Consumer Staples" },
+  RBLX: { sector: "Communication Services", category: "Digital Platforms & Media", subcategory: "Gaming Platforms", industry: "Internet & Digital Media" },
+  CHHD: { sector: "ETF", category: "Defensive Dividend ETF", subcategory: "Dividend Equity ETF", industry: "Diversified ETF" },
+  VSS: { sector: "ETF", category: "Broad Market ETF", subcategory: "Large-Cap Market ETF", industry: "Diversified ETF" },
+
+  MASK: { sector: "Information Technology", category: "Software & Cloud", subcategory: "Application Software", industry: "Software & Cloud" },
+  MNTS: { sector: "Industrials", category: "Aerospace & Defense", subcategory: "Space Infrastructure", industry: "Aerospace & Defense" },
+  DSY: { sector: "Information Technology", category: "Software & Cloud", subcategory: "Application Software", industry: "Software & Cloud" },
+  ERNA: { sector: "Health Care", category: "Healthcare & Biotech", subcategory: "Biotechnology", industry: "Healthcare & Biotech" },
+  CLDI: { sector: "Health Care", category: "Healthcare & Biotech", subcategory: "Biotechnology", industry: "Healthcare & Biotech" },
+  AZI: { sector: "Consumer Discretionary", category: "Automotive", subcategory: "Automotive Technology", industry: "Automotive" },
+  DXST: { sector: "Information Technology", category: "Software & Cloud", subcategory: "Technology Services", industry: "Software & Cloud" },
+  WCT: { sector: "Communication Services", category: "Communications", subcategory: "Telecommunications", industry: "Communications & Networking" },
+  AIXI: { sector: "Information Technology", category: "Artificial Intelligence", subcategory: "AI Software & Applications", industry: "Software & Cloud" },
+  CODX: { sector: "Health Care", category: "Healthcare & Biotech", subcategory: "Diagnostics", industry: "Healthcare & Biotech" },
+  GOVX: { sector: "Health Care", category: "Healthcare & Biotech", subcategory: "Vaccines & Biotechnology", industry: "Healthcare & Biotech" },
+  CHAI: { sector: "Consumer Staples", category: "Consumer Staples", subcategory: "Beverages", industry: "Consumer Staples" },
+  CDLX: { sector: "Communication Services", category: "Digital Platforms & Media", subcategory: "Advertising Technology", industry: "Internet & Digital Media" },
+  DCX: { sector: "Industrials", category: "Industrials & Manufacturing", subcategory: "Industrial Services", industry: "Industrials & Manufacturing" },
+  CLPR: { sector: "Real Estate", category: "Real Estate", subcategory: "Commercial Real Estate", industry: "Real Estate" }
+};
+
+const CATEGORY_CONFIG = {
+  "Artificial Intelligence": { marketBeta: 1.18 },
+  "Consumer Technology": { marketBeta: 1.02 },
+  "Electronics & Semiconductors": { marketBeta: 1.10 },
+  "Software & Cloud": { marketBeta: 1.05 },
+  "Digital Platforms & Media": { marketBeta: 1.08 },
+  "Entertainment & Media": { marketBeta: 0.98 },
+  "E-Commerce & Retail": { marketBeta: 1.00 },
+  "Financial Services": { marketBeta: 0.90 },
+  "Consumer Discretionary": { marketBeta: 1.00 },
+  "Consumer Staples": { marketBeta: 0.58 },
+  "Healthcare & Biotech": { marketBeta: 0.78 },
+  "Aerospace & Defense": { marketBeta: 0.82 },
+  "Energy": { marketBeta: 0.88 },
+  "Transportation & Travel": { marketBeta: 1.00 },
+  "Industrials & Manufacturing": { marketBeta: 0.88 },
+  "Communications": { marketBeta: 0.92 },
+  "Automotive": { marketBeta: 1.15 },
+  "Real Estate": { marketBeta: 0.72 },
+
+  // Empty/future top-level categories:
+  "Materials & Mining": { marketBeta: 0.82 },
+  "Utilities": { marketBeta: 0.45 },
+  "Agriculture": { marketBeta: 0.62 },
+
+  "Broad Market ETF": { marketBeta: 1.00 },
+  "Defensive Dividend ETF": { marketBeta: 0.62 }
+};
+
+const SUBCATEGORY_CONFIG = {
+  "AI Semiconductors": {},
+  "AI Platforms & Cloud": {},
+  "AI Platforms & Models": {},
+  "AI Enterprise Software": {},
+  "AI Creative Software": {},
+  "AI Software & Applications": {},
+
+  // Future AI subcategories can exist before any listing uses them.
+  "AI Robotics": {},
+  "AI Cybersecurity": {},
+  "AI Healthcare": {},
+  "AI Infrastructure": {}
+};
+
+const INDUSTRY_CONFIG = {
+  "Electronics & Semiconductors": {},
+  "Software & Cloud": {},
+  "Internet & Digital Media": {},
+  "Financial Services": {},
+  "Consumer Discretionary": {},
+  "Consumer Staples": {},
+  "Healthcare & Biotech": {},
+  "Aerospace & Defense": {},
+  "Energy": {},
+  "Transportation & Travel": {},
+  "Industrials & Manufacturing": {},
+  "Communications & Networking": {},
+  "Automotive": {},
+  "Real Estate": {},
+  "Materials & Mining": {},
+  "Utilities": {},
+  "Agriculture": {},
+  "Diversified ETF": {}
+};
+
+const DEFAULT_CATEGORY_BY_SECTOR = {
+  "Information Technology": "Software & Cloud",
+  "Technology": "Software & Cloud",
+  "Communication Services": "Digital Platforms & Media",
+  "Financials": "Financial Services",
+  "Consumer Discretionary": "Consumer Discretionary",
+  "Consumer Cyclical": "Consumer Discretionary",
+  "Consumer Staples": "Consumer Staples",
+  "Consumer Defensive": "Consumer Staples",
+  "Health Care": "Healthcare & Biotech",
+  "Healthcare": "Healthcare & Biotech",
+  "Industrials": "Industrials & Manufacturing",
+  "Energy": "Energy",
+  "Real Estate": "Real Estate",
+  "Utilities": "Utilities",
+  "Materials": "Materials & Mining",
+  "ETF": "Broad Market ETF"
+};
+
+function classifyStock(ticker, fallbackSector = "Industrials") {
+  const exact = STOCK_CLASSIFICATION[String(ticker || "").toUpperCase()];
+  if (exact) return exact;
+
+  const sector = String(fallbackSector || "Industrials");
+  const category = DEFAULT_CATEGORY_BY_SECTOR[sector] || "Industrials & Manufacturing";
+
+  return {
+    sector,
+    category,
+    subcategory: category,
+    industry: category
+  };
+}
+
+function ensureStockClassifications(state) {
+  if (!state || !state.companies) return;
+
+  for (const company of Object.values(state.companies)) {
+    const classification = classifyStock(company.ticker, company.sector);
+    company.sector = classification.sector;
+    company.category = classification.category;
+    company.subcategory = classification.subcategory;
+    company.industry = classification.industry;
+  }
+}
+
+function weightedFactor(components) {
+  let total = 0;
+  let weightSq = 0;
+
+  for (const [value, weight] of components) {
+    if (!Number.isFinite(Number(value)) || !Number.isFinite(Number(weight)) || weight === 0) continue;
+    total += Number(value) * Number(weight);
+    weightSq += Number(weight) * Number(weight);
+  }
+
+  return weightSq > 0 ? total / Math.sqrt(weightSq) : 0;
+}
+
+function averageCategoryShock(factors, names) {
+  if (!factors || !factors.categories || !Array.isArray(names) || !names.length) return 0;
+
+  let total = 0;
+  let count = 0;
+
+  for (const name of names) {
+    const value = Number(factors.categories[name]);
+    if (Number.isFinite(value)) {
+      total += value;
+      count += 1;
+    }
+  }
+
+  return count > 0 ? total / count : 0;
+}
+
+function buildMarketFactorStep() {
+  const categories = {};
+  const subcategories = {};
+  const industries = {};
+
+  for (const category of Object.keys(CATEGORY_CONFIG)) {
+    categories[category] = randomNormal();
+  }
+
+  // Include subcategories currently assigned to companies, plus explicitly
+  // supported future subcategories.
+  for (const classification of Object.values(STOCK_CLASSIFICATION)) {
+    if (classification.subcategory && subcategories[classification.subcategory] == null) {
+      subcategories[classification.subcategory] = randomNormal();
+    }
+  }
+  for (const subcategory of Object.keys(SUBCATEGORY_CONFIG)) {
+    if (subcategories[subcategory] == null) {
+      subcategories[subcategory] = randomNormal();
+    }
+  }
+
+  for (const industry of Object.keys(INDUSTRY_CONFIG)) {
+    industries[industry] = randomNormal();
+  }
+
+  return {
+    market: randomNormal(),
+    metals: randomNormal(),
+    oil: randomNormal(),
+    inflation: randomNormal(),
+    categories,
+    subcategories,
+    industries
+  };
+}
+
+function stockFactorFromRuntime(company, factors) {
+  const classification = classifyStock(company.ticker, company.sector);
+  const category = company.category || classification.category;
+  const subcategory = company.subcategory || classification.subcategory;
+  const industry = company.industry || classification.industry;
+  const config = CATEGORY_CONFIG[category] || { marketBeta: 1 };
+
+  if (category === "Broad Market ETF") {
+    return weightedFactor([
+      [factors.market, 0.80],
+      [averageCategoryShock(factors, [
+        "Artificial Intelligence",
+        "Consumer Technology",
+        "Software & Cloud",
+        "Digital Platforms & Media",
+        "Financial Services",
+        "Consumer Discretionary",
+        "Consumer Staples",
+        "Healthcare & Biotech",
+        "Industrials & Manufacturing",
+        "Energy"
+      ]), 0.40],
+      [randomNormal(), 0.16]
+    ]);
+  }
+
+  if (category === "Defensive Dividend ETF") {
+    return weightedFactor([
+      [factors.market, 0.34],
+      [averageCategoryShock(factors, [
+        "Consumer Staples",
+        "Healthcare & Biotech",
+        "Financial Services",
+        "Utilities"
+      ]), 0.64],
+      [randomNormal(), 0.18]
+    ]);
+  }
+
+  const components = [
+    [factors.market, 0.22 * (Number(config.marketBeta) || 1)],
+    [factors.categories[category] || 0, 0.38],
+    [factors.subcategories[subcategory] || 0, 0.26],
+    [factors.industries[industry] || 0, 0.28],
+    [randomNormal(), 0.58]
+  ];
+
+  // Commodity-sensitive INDUSTRIES. This is intentionally separate from the
+  // thematic category hierarchy.
+  if (industry === "Energy") components.push([factors.oil, 0.34]);
+  if (industry === "Transportation & Travel") components.push([factors.oil, -0.14]);
+  if (industry === "Consumer Discretionary") components.push([factors.oil, -0.05]);
+  if (industry === "Automotive") components.push([factors.oil, -0.06]);
+  if (industry === "Materials & Mining") components.push([factors.metals, 0.34]);
+  if (industry === "Industrials & Manufacturing") components.push([factors.oil, 0.07]);
+
+  return weightedFactor(components);
+}
+
+// Deterministic pseudo-random helpers are used only when a chart series must be
+// generated from scratch. Same-category stocks therefore receive the same
+// historical category component instead of completely unrelated fake histories.
+function seededHash(text) {
+  let hash = 2166136261 >>> 0;
+  const input = String(text);
+  for (let i = 0; i < input.length; i += 1) {
+    hash ^= input.charCodeAt(i);
+    hash = Math.imul(hash, 16777619) >>> 0;
+  }
+  return hash >>> 0;
+}
+
+function seededUnit(key) {
+  return (seededHash(key) + 1) / 4294967297;
+}
+
+function seededNormal(key) {
+  const u = Math.max(seededUnit(`${key}:u`), Number.EPSILON);
+  const v = Math.max(seededUnit(`${key}:v`), Number.EPSILON);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+function historicalStockFactor(company, bucket) {
+  const classification = classifyStock(company.ticker, company.sector);
+  const category = company.category || classification.category;
+  const subcategory = company.subcategory || classification.subcategory;
+  const industry = company.industry || classification.industry;
+  const config = CATEGORY_CONFIG[category] || { marketBeta: 1 };
+
+  const market = seededNormal(`market:${bucket}`);
+  const categoryShock = seededNormal(`category:${category}:${bucket}`);
+  const subcategoryShock = seededNormal(`subcategory:${subcategory}:${bucket}`);
+  const industryShock = seededNormal(`industry:${industry}:${bucket}`);
+  const idiosyncratic = seededNormal(`stock:${company.ticker}:${bucket}`);
+  const oil = seededNormal(`oil:${bucket}`);
+  const metals = seededNormal(`metals:${bucket}`);
+
+  if (category === "Broad Market ETF") {
+    return weightedFactor([
+      [market, 0.82],
+      [seededNormal(`category-broad:${bucket}`), 0.38],
+      [idiosyncratic, 0.14]
+    ]);
+  }
+
+  if (category === "Defensive Dividend ETF") {
+    return weightedFactor([
+      [market, 0.34],
+      [seededNormal(`category-defensive:${bucket}`), 0.64],
+      [idiosyncratic, 0.18]
+    ]);
+  }
+
+  const components = [
+    [market, 0.22 * (Number(config.marketBeta) || 1)],
+    [categoryShock, 0.38],
+    [subcategoryShock, 0.26],
+    [industryShock, 0.28],
+    [idiosyncratic, 0.58]
+  ];
+
+  if (industry === "Energy") components.push([oil, 0.34]);
+  if (industry === "Transportation & Travel") components.push([oil, -0.14]);
+  if (industry === "Consumer Discretionary") components.push([oil, -0.05]);
+  if (industry === "Automotive") components.push([oil, -0.06]);
+  if (industry === "Materials & Mining") components.push([metals, 0.34]);
+
+  return weightedFactor(components);
+}
+
+// Commodity factor coupling.
+// Electronics has a positive effect on BOTH precious metals, but silver's
+// coefficient is intentionally much larger.
+function commodityFactorFromRuntime(ticker, factors) {
+  const electronics = Number(factors.industries["Electronics & Semiconductors"]) || 0;
+  const industrials = Number(factors.industries["Industrials & Manufacturing"]) || 0;
+  const materials = Number(factors.industries["Materials & Mining"]) || 0;
+  const energy = Number(factors.industries["Energy"]) || 0;
+  const transport = Number(factors.industries["Transportation & Travel"]) || 0;
+  const consumer = Number(factors.industries["Consumer Discretionary"]) || 0;
+
+  if (ticker === "GOLD") {
+    return weightedFactor([
+      [factors.metals, 0.72],
+      [factors.inflation, 0.14],
+      [factors.market, -0.13],
+      [electronics, 0.11],
+      [materials, 0.24],
+      [randomNormal(), 0.34]
+    ]);
+  }
+
+  if (ticker === "SILVER") {
+    return weightedFactor([
+      [factors.metals, 0.68],
+      [factors.inflation, 0.12],
+      [factors.market, 0.05],
+      [electronics, 0.40],
+      [industrials, 0.20],
+      [materials, 0.28],
+      [randomNormal(), 0.34]
+    ]);
+  }
+
+  return weightedFactor([
+    [factors.oil, 0.68],
+    [factors.market, 0.08],
+    [energy, 0.46],
+    [transport, 0.13],
+    [industrials, 0.14],
+    [consumer, 0.08],
+    [randomNormal(), 0.38]
+  ]);
+}
+
+function historicalCommodityFactor(ticker, bucket) {
+  const metals = seededNormal(`metals:${bucket}`);
+  const oil = seededNormal(`oil:${bucket}`);
+  const inflation = seededNormal(`inflation:${bucket}`);
+  const market = seededNormal(`market:${bucket}`);
+  const electronics = seededNormal(`industry:Electronics & Semiconductors:${bucket}`);
+  const industrials = seededNormal(`industry:Industrials & Manufacturing:${bucket}`);
+  const materials = seededNormal(`industry:Materials & Mining:${bucket}`);
+  const energy = seededNormal(`industry:Energy:${bucket}`);
+  const transport = seededNormal(`industry:Transportation & Travel:${bucket}`);
+  const consumer = seededNormal(`industry:Consumer Discretionary:${bucket}`);
+  const idio = seededNormal(`commodity:${ticker}:${bucket}`);
+
+  if (ticker === "GOLD") {
+    return weightedFactor([
+      [metals, 0.72],
+      [inflation, 0.14],
+      [market, -0.13],
+      [electronics, 0.11],
+      [materials, 0.24],
+      [idio, 0.34]
+    ]);
+  }
+
+  if (ticker === "SILVER") {
+    return weightedFactor([
+      [metals, 0.68],
+      [inflation, 0.12],
+      [market, 0.05],
+      [electronics, 0.40],
+      [industrials, 0.20],
+      [materials, 0.28],
+      [idio, 0.34]
+    ]);
+  }
+
+  return weightedFactor([
+    [oil, 0.68],
+    [market, 0.08],
+    [energy, 0.46],
+    [transport, 0.13],
+    [industrials, 0.14],
+    [consumer, 0.08],
+    [idio, 0.38]
+  ]);
+}
+
 const YAHOO_HANDOFF_CONCURRENCY = clamp(
   Number(process.env.YAHOO_HANDOFF_CONCURRENCY) || 6,
   1,
@@ -706,13 +1463,102 @@ const YAHOO_HANDOFF_CONCURRENCY = clamp(
 );
 
 const FICTIONAL_INTERVALS = {
-  "1m": { minutes: 1, limit: 540 },
-  "5m": { minutes: 5, limit: 576 },
-  "15m": { minutes: 15, limit: 672 },
-  "30m": { minutes: 30, limit: 672 },
-  "1h": { minutes: 60, limit: 720 },
-  "1d": { minutes: 1440, limit: 420 }
+  // The Roblox chart shows 45 candles at once. These limits still allow several
+  // screens of history while preventing dormant series from growing forever.
+  "1m": { minutes: 1, limit: 180 },
+  "5m": { minutes: 5, limit: 180 },
+  "15m": { minutes: 15, limit: 180 },
+  "30m": { minutes: 30, limit: 180 },
+  "1h": { minutes: 60, limit: 200 },
+  "1d": { minutes: 1440, limit: 220 }
 };
+
+const CANDLE_CACHE_IDLE_MS = clamp(
+  Number(process.env.CANDLE_CACHE_IDLE_MS) || (5 * 60 * 1000),
+  60 * 1000,
+  60 * 60 * 1000
+);
+
+const CANDLE_CACHE_SWEEP_MS = 60 * 1000;
+const candleSeriesLastAccess = new Map();
+
+function candleCacheKey(kind, symbol, interval) {
+  return `${kind}:${String(symbol || "").toUpperCase()}:${String(interval || "")}`;
+}
+
+function touchCandleSeries(kind, symbol, interval) {
+  candleSeriesLastAccess.set(
+    candleCacheKey(kind, symbol, interval),
+    Date.now()
+  );
+}
+
+function clearAllCandleCaches(state) {
+  if (!state) return;
+
+  for (const company of Object.values(state.companies || {})) {
+    company.candles = {};
+  }
+
+  for (const asset of Object.values(state.cryptos || {})) {
+    asset.candles = {};
+  }
+
+  for (const asset of Object.values(state.commodities || {})) {
+    asset.candles = {};
+  }
+
+  candleSeriesLastAccess.clear();
+}
+
+function evictIdleCandleSeries() {
+  if (!marketState) return;
+
+  const now = Date.now();
+
+  function sweep(kind, collection, symbolField) {
+    for (const asset of Object.values(collection || {})) {
+      if (!asset || !asset.candles) continue;
+
+      const symbol = asset[symbolField];
+      for (const interval of Object.keys(asset.candles)) {
+        const key = candleCacheKey(kind, symbol, interval);
+        const lastAccess = candleSeriesLastAccess.get(key) || 0;
+
+        if (now - lastAccess >= CANDLE_CACHE_IDLE_MS) {
+          delete asset.candles[interval];
+          candleSeriesLastAccess.delete(key);
+        }
+      }
+    }
+  }
+
+  sweep("stock", marketState.companies, "ticker");
+  sweep("crypto", marketState.cryptos, "symbol");
+  sweep("commodity", marketState.commodities, "ticker");
+}
+
+function residentCandleStats() {
+  let series = 0;
+  let candles = 0;
+
+  function count(collection) {
+    for (const asset of Object.values(collection || {})) {
+      for (const value of Object.values(asset?.candles || {})) {
+        if (Array.isArray(value)) {
+          series += 1;
+          candles += value.length;
+        }
+      }
+    }
+  }
+
+  count(marketState?.companies);
+  count(marketState?.cryptos);
+  count(marketState?.commodities);
+
+  return { series, candles };
+}
 
 const INITIAL_COMPANIES = [
   ["ORNG", "Orange Inc.", "Technology", "mega", 310, 185.00, 0.1100, 0.2700, 0.0056, 0.96],
@@ -861,11 +1707,16 @@ function marketClock(nowMs = Date.now()) {
 }
 
 function companyFromSeed(seed, listedGameMinute = 0) {
-  const [ticker, name, sector, capGroup, valueBillions, ipoPrice, annualGrowth, annualVolatility, dividendYield, liquidity] = seed;
+  const [ticker, name, seedSector, capGroup, valueBillions, ipoPrice, annualGrowth, annualVolatility, dividendYield, liquidity] = seed;
+  const classification = classifyStock(ticker, seedSector);
+  const sector = classification.sector;
+  const category = classification.category;
+  const subcategory = classification.subcategory;
+  const industry = classification.industry;
   const companyValue = valueBillions * 1e9;
   const sharesOutstanding = companyValue / ipoPrice;
   return {
-    ticker, name, sector, capGroup, companyValue, sharesOutstanding,
+    ticker, name, sector, category, subcategory, industry, capGroup, companyValue, sharesOutstanding,
     price: ipoPrice, prevClose: ipoPrice, initialPrice: ipoPrice,
     annualGrowth, annualVolatility, dividendYield,
     quarterlyDividend: dividendYield > 0 ? ipoPrice * dividendYield / 4 : 0,
@@ -928,6 +1779,8 @@ function newMarketState() {
     companies[seed[0]] = company;
   }
 
+  ensureStockClassifications({ companies });
+
   const state = {
     version: 5,
     catalogVersion: FICTIONAL_CATALOG_VERSION,
@@ -941,6 +1794,7 @@ function newMarketState() {
     nextNewsGameMinute: CLOCK_START_MINUTE + 120,
     companies,
     cryptos: buildInitialSimulatedCryptoMap(),
+    commodities: buildInitialSimulatedCommodityMap(),
     news: [],
     tradeReceipts: {},
     handoffReady: false,
@@ -1274,7 +2128,16 @@ function saveStateNow() {
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
     const temporary = `${STATE_FILE}.tmp`;
-    fs.writeFileSync(temporary, JSON.stringify(marketState));
+
+    // Candle histories are regenerable caches, not authoritative market state.
+    // Skipping them keeps the state file tiny and prevents JSON.stringify from
+    // allocating a second giant copy of every chart in RAM during each save.
+    const serialized = JSON.stringify(marketState, (key, value) => {
+      if (key === "candles") return undefined;
+      return value;
+    });
+
+    fs.writeFileSync(temporary, serialized);
     fs.renameSync(temporary, STATE_FILE);
   } catch (error) {
     console.error(`[FICTIONAL] State save failed: ${error.message}`);
@@ -1304,9 +2167,24 @@ function loadState() {
     }
 
     marketState = parsed;
+    ensureStockClassifications(marketState);
     ensureSimulatedCryptoState(marketState);
-    marketState.news = Array.isArray(marketState.news) ? marketState.news : [];
+    ensureSimulatedCommodityState(marketState);
+
+    // v11 and older state files may contain tens of thousands of candle objects.
+    // Drop them immediately; they are rebuilt lazily when a chart is requested.
+    clearAllCandleCaches(marketState);
+    marketState.news = Array.isArray(marketState.news)
+      ? marketState.news.slice(0, 120)
+      : [];
+
     marketState.tradeReceipts = marketState.tradeReceipts || {};
+    const loadedReceiptIds = Object.keys(marketState.tradeReceipts);
+    if (loadedReceiptIds.length > 500) {
+      for (const id of loadedReceiptIds.slice(0, loadedReceiptIds.length - 500)) {
+        delete marketState.tradeReceipts[id];
+      }
+    }
     marketState.catalogVersion = FICTIONAL_CATALOG_VERSION;
     marketState.clockMode = "accelerated-fictional-week";
     marketState.handoffReady = marketState.handoffReady === true;
@@ -1370,6 +2248,9 @@ function companyRow(company, clock = marketClock()) {
     companyName: company.name,
     name: company.name,
     sector: company.sector,
+    category: company.category,
+    subcategory: company.subcategory,
+    industry: company.industry,
     capGroup: company.capGroup,
     assetType: "fictional-stock",
     fictional: true,
@@ -1417,30 +2298,29 @@ function candleRecord(bucketMinute, open, high, low, close, volume, session) {
 
   return {
     t: safeBucket * 60,
-    ts: safeBucket * 60,
-    time: safeBucket * 60,
-    timestamp: safeBucket * 60,
     bucketMinute: safeBucket,
-    datetime: `${DAY_NAMES[dayOfWeekIndex]} ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`,
     o, h, l, c, v,
-    open: o, high: h, low: l, close: c, volume: v,
     session,
     gameDayIndex: dayIndex,
-    gameDayName: DAY_NAMES[dayOfWeekIndex],
     gameMinuteOfDay: minuteOfDay
   };
 }
 
 function ensureCandleSeries(company, intervalKey) {
   company.candles = company.candles || {};
-  if (Array.isArray(company.candles[intervalKey]) && company.candles[intervalKey].length) return company.candles[intervalKey];
+
+  if (Array.isArray(company.candles[intervalKey]) && company.candles[intervalKey].length) {
+    touchCandleSeries("stock", company.ticker, intervalKey);
+    return company.candles[intervalKey];
+  }
+
   const spec = FICTIONAL_INTERVALS[intervalKey];
   if (!spec) return [];
   const nowMinute = marketClock().totalMinutes;
   const buckets = [];
   let cursor = Math.floor(nowMinute / spec.minutes) * spec.minutes;
   let safety = 0;
-  while (buckets.length < 220 && safety < 50000) {
+  while (buckets.length < spec.limit && safety < 50000) {
     const session = sessionForMinute(cursor);
     if (intervalKey === "1d") {
       const dayIndex = Math.floor(cursor / MINUTES_PER_DAY);
@@ -1459,26 +2339,38 @@ function ensureCandleSeries(company, intervalKey) {
     const session = sessionForMinute(bucket);
     const open = price;
     const scale = company.annualVolatility * Math.sqrt(spec.minutes / (252 * 960));
-    price = Math.max(0.05, open * Math.exp(company.annualGrowth * spec.minutes / (252 * 960) + randomNormal() * scale));
-    const wick = Math.abs(randomNormal()) * scale * open * 0.45;
+    const factor = historicalStockFactor(company, bucket);
+    price = Math.max(
+      0.05,
+      open * Math.exp(
+        company.annualGrowth * spec.minutes / (252 * 960)
+        + factor * scale
+      )
+    );
+    const wick =
+      Math.abs(seededNormal(`stock-wick:${company.ticker}:${bucket}`))
+      * scale * open * 0.45;
     series.push(candleRecord(bucket, open, Math.max(open, price) + wick, Math.min(open, price) - wick, price, 1000 + Math.random() * 80000, session === "closed" ? "regular" : session));
   }
   if (series.length) {
-    const ratio = company.price / series[series.length - 1].close;
+    const ratio = company.price / series[series.length - 1].c;
     for (const candle of series) {
-      candle.open = candle.o = round(candle.open * ratio, 4);
-      candle.high = candle.h = round(candle.high * ratio, 4);
-      candle.low = candle.l = round(candle.low * ratio, 4);
-      candle.close = candle.c = round(candle.close * ratio, 4);
+      candle.o = round(candle.o * ratio, 4);
+      candle.h = round(candle.h * ratio, 4);
+      candle.l = round(candle.l * ratio, 4);
+      candle.c = round(candle.c * ratio, 4);
     }
   }
   company.candles[intervalKey] = series.slice(-spec.limit);
+  touchCandleSeries("stock", company.ticker, intervalKey);
   return company.candles[intervalKey];
 }
 
 function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elapsedGameMinutes = 0) {
-  for (const [intervalKey, spec] of Object.entries(FICTIONAL_INTERVALS)) {
-    const series = ensureCandleSeries(company, intervalKey);
+  const candleEntries = Object.entries(company.candles || {});
+  for (const [intervalKey, series] of candleEntries) {
+    const spec = FICTIONAL_INTERVALS[intervalKey];
+    if (!spec || !Array.isArray(series) || series.length === 0) continue;
     const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
     const current = series[series.length - 1];
     const currentBucket = current ? Number(current.bucketMinute) : null;
@@ -1497,28 +2389,75 @@ function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elap
       series.push(candleRecord(bucket, priorPrice, Math.max(priorPrice, price), Math.min(priorPrice, price), price, volume, clock.session));
       if (series.length > spec.limit) series.splice(0, series.length - spec.limit);
     } else {
-      current.high = current.h = round(Math.max(current.high, price), 4);
-      current.low = current.l = round(Math.min(current.low, price), 4);
-      current.close = current.c = round(price, 4);
-      current.volume = current.v = Math.round((current.volume || 0) + volume);
+      current.h = round(Math.max(current.h, price), 4);
+      current.l = round(Math.min(current.l, price), 4);
+      current.c = round(price, 4);
+      current.v = Math.round((current.v || 0) + volume);
       current.session = clock.session;
     }
   }
 }
 
-function updateCompany(company, elapsedGameMinutes, clock) {
+function updateCompany(company, elapsedGameMinutes, clock, factors) {
   if (!(elapsedGameMinutes > 0)) return;
-  const effectiveGrowth = company.annualGrowth + (clock.totalMinutes < Number(company.temporaryGrowthUntil || 0) ? Number(company.temporaryGrowth || 0) : 0);
-  const valueMove = effectiveGrowth * elapsedGameMinutes / (365 * MINUTES_PER_DAY) +
-    company.annualVolatility * 0.28 * randomNormal() * Math.sqrt(elapsedGameMinutes / (365 * MINUTES_PER_DAY));
-  company.companyValue = Math.max(2e6, company.companyValue * Math.exp(valueMove));
+
+  const classification = classifyStock(company.ticker, company.sector);
+  company.sector = classification.sector;
+  company.category = classification.category;
+  company.subcategory = classification.subcategory;
+  company.industry = classification.industry;
+
+  const effectiveGrowth =
+    company.annualGrowth
+    + (
+      clock.totalMinutes < Number(company.temporaryGrowthUntil || 0)
+        ? Number(company.temporaryGrowth || 0)
+        : 0
+    );
+
+  const sharedFactor = stockFactorFromRuntime(company, factors);
+
+  // Company fundamentals also share some category movement, so correlated price
+  // action is not just a temporary quote-layer effect.
+  const valueMove =
+    effectiveGrowth * elapsedGameMinutes / (365 * MINUTES_PER_DAY)
+    + company.annualVolatility
+      * 0.28
+      * sharedFactor
+      * Math.sqrt(elapsedGameMinutes / (365 * MINUTES_PER_DAY));
+
+  company.companyValue = Math.max(
+    2e6,
+    company.companyValue * Math.exp(valueMove)
+  );
+
   if (!clock.isTradingAllowed) return;
+
   const fairPrice = company.companyValue / company.sharesOutstanding;
-  const randomMove = company.annualVolatility * (clock.session === "open" ? 1 : 0.52) * randomNormal() * Math.sqrt(elapsedGameMinutes / (252 * 960));
-  const fairPull = ((fairPrice - company.price) / Math.max(company.price, 0.01)) * clamp(elapsedGameMinutes / 240, 0, 0.22);
+  const randomMove =
+    company.annualVolatility
+    * (clock.session === "open" ? 1 : 0.52)
+    * sharedFactor
+    * Math.sqrt(elapsedGameMinutes / (252 * 960));
+
+  const fairPull =
+    ((fairPrice - company.price) / Math.max(company.price, 0.01))
+    * clamp(elapsedGameMinutes / 240, 0, 0.22);
+
   const prior = company.price;
-  company.price = Math.max(0.05, company.price * Math.exp(randomMove + fairPull));
-  updateCandles(company, prior, company.price, clock, 0, elapsedGameMinutes);
+  company.price = Math.max(
+    0.05,
+    company.price * Math.exp(randomMove + fairPull)
+  );
+
+  updateCandles(
+    company,
+    prior,
+    company.price,
+    clock,
+    0,
+    elapsedGameMinutes
+  );
 }
 
 function newsTemplate(positive) {
@@ -1564,7 +2503,7 @@ function generateCompanyNews(clock) {
     publishedAt: Math.floor(Date.now() / 1000), url: ""
   };
   marketState.news.unshift(article);
-  marketState.news = marketState.news.slice(0, 300);
+  marketState.news = marketState.news.slice(0, 120);
   marketState.nextNewsGameMinute = clock.totalMinutes + 8 + Math.floor(Math.random() * 18);
   console.log(`[FICTIONAL NEWS] ${article.headline} (${article.impactPct}%)`);
   queueSave();
@@ -1620,7 +2559,7 @@ function createWeeklyIpo(week, clock) {
     publishedAtGameMinute: clock.totalMinutes,
     publishedAt: Math.floor(Date.now() / 1000), url: ""
   });
-  marketState.news = marketState.news.slice(0, 300);
+  marketState.news = marketState.news.slice(0, 120);
   marketState.lastIpoWeek = week;
   console.log(`[FICTIONAL IPO] Week ${week}: ${ticker} ${name} at $${ipoPrice.toFixed(2)}`);
   queueSave(0);
@@ -1645,8 +2584,16 @@ function engineStep() {
   const elapsedGameMinutes = elapsedGameSeconds / 60;
 
   if (elapsedGameSeconds > 0) {
+    const factors = buildMarketFactorStep();
+
+    ensureStockClassifications(marketState);
     for (const company of Object.values(marketState.companies)) {
-      updateCompany(company, elapsedGameMinutes, clock);
+      updateCompany(company, elapsedGameMinutes, clock, factors);
+    }
+
+    ensureSimulatedCommodityState(marketState);
+    for (const asset of Object.values(marketState.commodities)) {
+      updateSimulatedCommodity(asset, elapsedGameMinutes, clock, factors);
     }
 
     ensureSimulatedCryptoState(marketState);
@@ -1675,7 +2622,7 @@ function engineStep() {
     queueSave();
   }
 
-  if (Date.now() - lastPeriodicSaveAt >= 30000) {
+  if (Date.now() - lastPeriodicSaveAt >= 60000) {
     lastPeriodicSaveAt = Date.now();
     queueSave();
   }
@@ -1843,6 +2790,9 @@ async function assignGroupRole(userId, desiredRoleResource) {
 // ============================
 app.get("/health", (_req, res) => {
   const clock = marketClock();
+  const memory = process.memoryUsage();
+  const candleStats = residentCandleStats();
+
   res.json({
     status: "ok",
     backend: "main-game-fictional-exchange",
@@ -1874,7 +2824,16 @@ app.get("/health", (_req, res) => {
     fictionalTradeSecretConfigured: Boolean(FICTIONAL_TRADE_SECRET),
     groupSyncConfigured: Boolean(GROUP_SYNC_SECRET && ROBLOX_OPEN_CLOUD_API_KEY),
     cryptoCached: marketState?.cryptos ? Object.keys(marketState.cryptos).length : 0,
-    commodityCached: Object.keys(commodityPriceCache).length
+    commodityCached: marketState?.commodities ? Object.keys(marketState.commodities).length : 0,
+    residentCandleSeries: candleStats.series,
+    residentCandles: candleStats.candles,
+    candleCacheIdleSeconds: Math.round(CANDLE_CACHE_IDLE_MS / 1000),
+    memoryMb: {
+      rss: round(memory.rss / 1024 / 1024, 2),
+      heapUsed: round(memory.heapUsed / 1024 / 1024, 2),
+      heapTotal: round(memory.heapTotal / 1024 / 1024, 2),
+      external: round(memory.external / 1024 / 1024, 2)
+    }
   });
 });
 
@@ -1913,29 +2872,107 @@ app.get("/crypto/candles", async (req, res) => {
   res.json(await getCryptoCandles(symbol, String(req.query.interval || "1m").toLowerCase()));
 });
 
-app.get("/commodity/prices", async (req, res) => {
+app.get("/commodity/prices", async (_req, res) => {
   res.set("Cache-Control", "no-store");
-  const force = req.query.fresh === "1" || req.query.fresh === "true";
-  await Promise.allSettled(Object.keys(COMMODITIES).map(ticker => refreshCommodityTicker(ticker, force)));
-  const prices = {};
-  for (const ticker of Object.keys(COMMODITIES)) if (commodityPriceCache[ticker]) prices[ticker] = commodityPriceCache[ticker];
-  res.json({ success: Object.keys(prices).length > 0, prices, source: "Yahoo Finance commodity futures", updatedAt: Math.floor(Date.now() / 1000) });
+  res.json(await getCommodityPrices());
 });
 
 app.get("/commodity/price", async (req, res) => {
   res.set("Cache-Control", "no-store");
   const ticker = normalizeCommodityTicker(req.query.ticker);
-  if (!ticker) return res.status(400).json({ error: "Unknown commodity ticker." });
-  try { res.json(await refreshCommodityTicker(ticker, req.query.fresh === "1")); }
-  catch (error) { res.status(502).json({ ticker, error: error.message }); }
+  if (!ticker) return res.status(400).json({ error: "Unknown fictional commodity." });
+
+  const result = await getCommodityPrices();
+  const row = result.prices && result.prices[ticker];
+  if (!row) return res.status(404).json({ ticker, error: "Commodity unavailable." });
+  res.json(row);
 });
 
 app.get("/commodity/candles", async (req, res) => {
   res.set("Cache-Control", "no-store");
   const ticker = normalizeCommodityTicker(req.query.ticker);
-  if (!ticker) return res.status(400).json({ error: "Unknown commodity ticker." });
+  if (!ticker) return res.status(400).json({ error: "Unknown fictional commodity." });
   res.json(await getCommodityCandles(ticker, String(req.query.interval || "1m").toLowerCase()));
 });
+
+app.get("/fictional/categories", (_req, res) => {
+  res.set("Cache-Control", "no-store");
+
+  const categoryMembers = {};
+  const subcategoryMembers = {};
+  const industryMembers = {};
+
+  for (const company of Object.values(marketState?.companies || {})) {
+    const classification = classifyStock(company.ticker, company.sector);
+    const category = company.category || classification.category;
+    const subcategory = company.subcategory || classification.subcategory;
+    const industry = company.industry || classification.industry;
+
+    categoryMembers[category] = categoryMembers[category] || [];
+    categoryMembers[category].push(company.ticker);
+
+    subcategoryMembers[subcategory] = subcategoryMembers[subcategory] || [];
+    subcategoryMembers[subcategory].push(company.ticker);
+
+    industryMembers[industry] = industryMembers[industry] || [];
+    industryMembers[industry].push(company.ticker);
+  }
+
+  const categoryNames = Array.from(new Set([
+    ...Object.keys(CATEGORY_CONFIG),
+    ...Object.keys(categoryMembers)
+  ]));
+
+  const subcategoryNames = Array.from(new Set([
+    ...Object.keys(SUBCATEGORY_CONFIG),
+    ...Object.keys(subcategoryMembers)
+  ]));
+
+  const industryNames = Array.from(new Set([
+    ...Object.keys(INDUSTRY_CONFIG),
+    ...Object.keys(industryMembers)
+  ]));
+
+  res.json({
+    success: true,
+    hierarchy: "Sector -> Category -> Subcategory",
+    categories: categoryNames.map(name => ({
+      name,
+      members: categoryMembers[name] || [],
+      memberCount: (categoryMembers[name] || []).length
+    })),
+    subcategories: subcategoryNames.map(name => ({
+      name,
+      members: subcategoryMembers[name] || [],
+      memberCount: (subcategoryMembers[name] || []).length
+    })),
+    industries: industryNames.map(name => ({
+      name,
+      members: industryMembers[name] || [],
+      memberCount: (industryMembers[name] || []).length
+    })),
+    commodityLinks: {
+      GOLD: {
+        sharedMetalFactor: true,
+        electronicsIndustryEffect: "positive",
+        note: "Gold responds positively to electronics demand, but less than silver."
+      },
+      SILVER: {
+        sharedMetalFactor: true,
+        electronicsIndustryEffect: "strong positive",
+        note: "AI semiconductor stocks still carry the Electronics & Semiconductors industry factor."
+      },
+      OIL: {
+        strongestIndustries: [
+          "Energy",
+          "Industrials & Manufacturing",
+          "Transportation & Travel"
+        ]
+      }
+    }
+  });
+});
+
 
 app.get("/fictional/handoff/status", (_req, res) => {
   res.set("Cache-Control", "no-store");
@@ -2154,7 +3191,7 @@ app.post("/fictional/trade", (req, res) => {
   if (requestId) {
     marketState.tradeReceipts[requestId] = result;
     const ids = Object.keys(marketState.tradeReceipts);
-    if (ids.length > 5000) for (const id of ids.slice(0, ids.length - 4000)) delete marketState.tradeReceipts[id];
+    if (ids.length > 600) for (const id of ids.slice(0, ids.length - 500)) delete marketState.tradeReceipts[id];
   }
   queueSave();
   res.json(result);
@@ -2212,6 +3249,14 @@ async function startServer() {
 
   setInterval(engineStep, 1000);
 
+  const candleSweepTimer = setInterval(
+    evictIdleCandleSeries,
+    CANDLE_CACHE_SWEEP_MS
+  );
+  if (typeof candleSweepTimer.unref === "function") {
+    candleSweepTimer.unref();
+  }
+
   if (marketState.handoffReady !== true) {
     startAutomaticHandoffLoop();
   }
@@ -2219,7 +3264,7 @@ async function startServer() {
   app.listen(PORT, () => {
     const clock = marketClock();
     console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
-    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; 5 fully fictional cryptocurrencies enabled; commodities remain separate.`);
+    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; 5 fictional cryptocurrencies and 3 fictional commodities enabled.`);
 console.log(`[SERVER] Fictional stock prices evolve at game-second resolution; candles retain normal timeframe buckets.`);
     console.log(`[SERVER] Fictional clock configured for ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
     if (marketState.handoffReady === true) {
