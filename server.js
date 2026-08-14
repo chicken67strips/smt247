@@ -2977,6 +2977,12 @@ function createWeeklyIpo(week, clock) {
 function engineStep() {
   if (!marketState) return;
   if (marketState.handoffReady !== true) return;
+
+  // The one-time alignment simulator owns marketState while it is running.
+  // HTTP requests may still be served, but they must not cause a second clock
+  // advancement through engineStep at the same time.
+  if (marketFastForwardInProgress) return;
+
   const clock = marketClock();
 
   // Evolve prices at game-second resolution while candles remain grouped into
@@ -3370,16 +3376,62 @@ function applyVirtualFastForwardStep(clock, elapsedGameMinutes) {
   marketState.lastUpdatedGameMinute = clock.totalMinutes;
 }
 
-function simulateMarketForwardTo(targetGameSecond) {
+function nextFastForwardBoundarySecond(cursor, target) {
+  const current = Math.max(0, Math.floor(Number(cursor) || 0));
+  const maximumTarget = Math.max(current + 1, Math.floor(Number(target) || current + 1));
+
+  // Default to five fictional minutes. The price equations already scale drift
+  // linearly and volatility by sqrt(time), so this preserves the same stochastic
+  // model without requiring thousands of consecutive one-minute JS loops.
+  let next = Math.min(maximumTarget, current + 5 * 60);
+
+  const currentMinute = Math.floor(current / 60);
+  const currentDay = Math.floor(currentMinute / MINUTES_PER_DAY);
+
+  // Never jump across the market/session boundaries that materially change the
+  // simulation rules or the daily-close baseline.
+  const importantMinutes = [
+    currentDay * MINUTES_PER_DAY + 240,   // stock pre-market 4:00 AM
+    currentDay * MINUTES_PER_DAY + 570,   // regular open 9:30 AM
+    currentDay * MINUTES_PER_DAY + 960,   // regular close 4:00 PM
+    currentDay * MINUTES_PER_DAY + 1020,  // commodity maintenance 5:00 PM
+    currentDay * MINUTES_PER_DAY + 1080,  // commodity reopen 6:00 PM
+    currentDay * MINUTES_PER_DAY + 1200,  // stock after-hours close 8:00 PM
+    (currentDay + 1) * MINUTES_PER_DAY    // midnight/day rollover
+  ];
+
+  for (const minute of importantMinutes) {
+    const second = minute * 60;
+    if (second > current && second < next) {
+      next = second;
+    }
+  }
+
+  // Also stop exactly at the next scheduled fictional news event when it falls
+  // inside this chunk, so its market effect starts at the correct point.
+  const nextNewsMinute = Number(marketState.nextNewsGameMinute);
+  if (Number.isFinite(nextNewsMinute)) {
+    const newsSecond = Math.floor(nextNewsMinute * 60);
+    if (newsSecond > current && newsSecond < next) {
+      next = newsSecond;
+    }
+  }
+
+  return Math.max(current + 1, Math.min(next, maximumTarget));
+}
+
+async function simulateMarketForwardTo(targetGameSecond) {
   const target = Math.max(
     0,
     Math.floor(Number(targetGameSecond) || 0)
   );
 
-  let cursor = Math.max(
+  const originalCursor = Math.max(
     0,
     Math.floor(Number(marketState.lastUpdatedGameSecond) || 0)
   );
+
+  let cursor = originalCursor;
 
   if (target <= cursor) {
     return {
@@ -3393,36 +3445,36 @@ function simulateMarketForwardTo(targetGameSecond) {
     Number(marketState.news?.length) || 0;
 
   let steps = 0;
+  let stepsSinceYield = 0;
 
-  // One game-minute simulation steps are intentional:
-  // - accurate session/day/week transitions
-  // - accurate daily-close rollover
-  // - correlated market factor generated for each skipped minute
-  // - much cheaper and safer than hundreds of thousands of 1-second startup loops
   while (cursor < target) {
-    const remaining = target - cursor;
-    const stepSeconds = Math.min(60, remaining);
-    cursor += stepSeconds;
+    const nextCursor =
+      nextFastForwardBoundarySecond(cursor, target);
+
+    const stepSeconds = nextCursor - cursor;
+    cursor = nextCursor;
 
     const clock = virtualClockFromGameSecond(cursor);
+
     applyVirtualFastForwardStep(
       clock,
       stepSeconds / 60
     );
 
     steps += 1;
+    stepsSinceYield += 1;
+
+    // Yield frequently so Railway's HTTP server, health checks, and Roblox
+    // requests remain responsive throughout the one-time migration.
+    if (stepsSinceYield >= 20) {
+      stepsSinceYield = 0;
+      await new Promise(resolve => setImmediate(resolve));
+    }
   }
 
   return {
-    simulatedGameSeconds:
-      target
-      - Math.max(
-        0,
-        Math.floor(Number(marketState.clockAlignmentStartGameSecond) || 0)
-      ),
+    simulatedGameSeconds: target - originalCursor,
     simulatedSteps: steps,
-    // News is capped at 120, so this is only the retained-count delta. The log
-    // below separately reports the number of minute simulation steps.
     retainedNewsCountDelta:
       (Number(marketState.news?.length) || 0)
       - startingNewsCount
@@ -3433,7 +3485,7 @@ function formatAlignmentClock(clock) {
   return `${clock.dayName} ${clock.exactTime}`;
 }
 
-function performOneTimeReal930Alignment() {
+async function performOneTimeReal930Alignment() {
   if (!marketState || marketState.handoffReady !== true) {
     return false;
   }
@@ -3445,12 +3497,13 @@ function performOneTimeReal930Alignment() {
     return false;
   }
 
+  // Catch persisted state up to the deployment moment before the special
+  // simulator takes exclusive ownership.
+  engineStep();
+
   marketFastForwardInProgress = true;
 
   try {
-    // First catch the persisted market up to the exact real deployment moment.
-    engineStep();
-
     const alignmentNowMs = Date.now();
     const currentClock = marketClock(alignmentNowMs);
     const nextReal930Ms =
@@ -3494,10 +3547,10 @@ function performOneTimeReal930Alignment() {
     );
 
     const result =
-      simulateMarketForwardTo(targetGameSecond);
+      await simulateMarketForwardTo(targetGameSecond);
 
-    // Move the clock anchor only AFTER all skipped market state has been
-    // simulated. This avoids one giant elapsed-time engine step.
+    // Switch the live phase only after all skipped market movement has been
+    // simulated.
     marketState.clockAnchorRealMs = alignmentNowMs;
     marketState.clockAnchorGameSeconds = targetGameSecond;
     marketState.lastUpdatedGameSecond = targetGameSecond;
@@ -3517,7 +3570,7 @@ function performOneTimeReal930Alignment() {
 
     console.log(
       `[CLOCK ALIGNMENT] Simulated ${result.simulatedSteps} ` +
-      `minute/partial-minute market steps before moving the anchor.`
+      `bounded market steps before moving the anchor.`
     );
 
     console.log(
@@ -3702,6 +3755,9 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     backend: "main-game-fictional-exchange",
+    alignmentInProgress: marketFastForwardInProgress,
+    marketClockAlignmentVersion:
+      Number(marketState.marketClockAlignmentVersion) || 0,
     companyCount: Object.keys(marketState.companies).length,
     gameWeek: clock.week,
     gameDay: clock.dayName,
@@ -4059,6 +4115,14 @@ app.get("/fictional/ipo/current", (_req, res) => {
 app.post("/fictional/trade", (req, res) => {
   if (!authorizeFictionalTrade(req, res)) return;
 
+  if (marketFastForwardInProgress) {
+    return res.status(503).json({
+      success: false,
+      alignmentInProgress: true,
+      error: "One-time fictional market clock alignment is finishing. Please retry in a moment."
+    });
+  }
+
   if (marketState.handoffReady !== true) {
     return res.status(503).json({
       success: false,
@@ -4267,8 +4331,37 @@ async function startServer() {
     await attemptAutomaticExactHandoff();
   }
 
+  // IMPORTANT: bind Railway's port BEFORE running any potentially expensive
+  // one-time market migration. v16 did this in the opposite order, which caused
+  // Railway's proxy to return HTTP 502 until the entire fast-forward completed.
+  app.listen(PORT, () => {
+    const clock = marketClock();
+    console.log(`[SERVER] Main-game fictional exchange listening on port ${PORT}.`);
+    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; 5 fictional cryptocurrencies and 3 fictional commodities enabled.`);
+    console.log(`[SERVER] Fictional stock prices evolve at game-second resolution; candles retain normal timeframe buckets.`);
+    console.log(`[SERVER] Fictional clock currently ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
+
+    if (marketState.handoffReady === true) {
+      console.log(`[SERVER] Exact price handoff is READY for ${marketState.handoffPriceCount || 0} tickers.`);
+    } else {
+      console.warn(`[SERVER] WAITING FOR EXACT YAHOO PRICE HANDOFF. Fictional seed prices remain blocked while Railway retries.`);
+    }
+  });
+
+  // Give Node one event-loop turn so Railway can accept connections immediately.
+  await new Promise(resolve => setImmediate(resolve));
+
   if (marketState.handoffReady === true) {
-    performOneTimeReal930Alignment();
+    try {
+      await performOneTimeReal930Alignment();
+    } catch (error) {
+      // A failed alignment must never take the whole market API offline.
+      console.error(
+        `[CLOCK ALIGNMENT] Failed; keeping the existing clock phase instead: ` +
+        `${error && error.stack || error}`
+      );
+      marketFastForwardInProgress = false;
+    }
   }
 
   setInterval(engineStep, 1000);
@@ -4285,18 +4378,11 @@ async function startServer() {
     startAutomaticHandoffLoop();
   }
 
-  app.listen(PORT, () => {
-    const clock = marketClock();
-    console.log(`[SERVER] Main-game fictional exchange ready on port ${PORT}.`);
-    console.log(`[SERVER] ${Object.keys(marketState.companies).length} simulated main-game stocks; 5 fictional cryptocurrencies and 3 fictional commodities enabled.`);
-console.log(`[SERVER] Fictional stock prices evolve at game-second resolution; candles retain normal timeframe buckets.`);
-    console.log(`[SERVER] Fictional clock configured for ${clock.dayName} ${clock.exactTime}; 1 game minute = ${REAL_SECONDS_PER_GAME_MINUTE} real seconds.`);
-    if (marketState.handoffReady === true) {
-      console.log(`[SERVER] Exact price handoff is READY for ${marketState.handoffPriceCount || 0} tickers.`);
-    } else {
-      console.warn(`[SERVER] WAITING FOR EXACT YAHOO PRICE HANDOFF. Fictional seed prices remain blocked while Railway retries.`);
-    }
-  });
+  const finalClock = marketClock();
+  console.log(
+    `[SERVER] Market engine active at ${finalClock.dayName} ` +
+    `${finalClock.exactTime}.`
+  );
 }
 
 startServer().catch(error => {
