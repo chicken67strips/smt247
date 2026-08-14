@@ -1851,6 +1851,7 @@ const IPO_NAME_PARTS = {
 let marketState = null;
 let saveTimer = null;
 let lastPeriodicSaveAt = Date.now();
+let marketFastForwardInProgress = false;
 let automaticHandoffInProgress = false;
 let automaticHandoffAttemptCount = 0;
 let automaticHandoffLastError = "";
@@ -2391,6 +2392,7 @@ function saveStateNow() {
 }
 
 function queueSave(delayMs = 1000) {
+  if (marketFastForwardInProgress) return;
   if (saveTimer) return;
   saveTimer = setTimeout(() => {
     saveTimer = null;
@@ -2910,7 +2912,9 @@ function generateCompanyNews(clock) {
   marketState.news.unshift(article);
   marketState.news = marketState.news.slice(0, 120);
   marketState.nextNewsGameMinute = clock.totalMinutes + 8 + Math.floor(Math.random() * 18);
-  console.log(`[FICTIONAL NEWS] ${article.headline} (${article.impactPct}%)`);
+  if (!marketFastForwardInProgress) {
+    console.log(`[FICTIONAL NEWS] ${article.headline} (${article.impactPct}%)`);
+  }
   queueSave();
 }
 
@@ -3039,6 +3043,494 @@ function engineStep() {
   if (Date.now() - lastPeriodicSaveAt >= 60000) {
     lastPeriodicSaveAt = Date.now();
     queueSave();
+  }
+}
+
+
+// ============================
+// One-time real 9:30 AM ET clock alignment
+// ============================
+// This migration runs ONCE. It advances the fictional clock to a forward-only
+// phase where the NEXT regular 9:30 AM fictional open occurs at the next real
+// 9:30 AM Eastern Time.
+//
+// It deliberately does NOT keep re-aligning afterward. Once applied, the normal
+// 2x fictional clock continues freely and future real-world open times drift
+// according to the fictional weekday/weekend schedule.
+const MARKET_CLOCK_ALIGNMENT_VERSION = 1;
+const EASTERN_TIME_ZONE = "America/New_York";
+
+const easternClockFormatter = new Intl.DateTimeFormat("en-US", {
+  timeZone: EASTERN_TIME_ZONE,
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23"
+});
+
+function easternClockParts(unixMs) {
+  const parts = {};
+  for (const part of easternClockFormatter.formatToParts(new Date(unixMs))) {
+    if (part.type !== "literal") {
+      parts[part.type] = Number(part.value);
+    }
+  }
+
+  return {
+    year: parts.year,
+    month: parts.month,
+    day: parts.day,
+    hour: parts.hour,
+    minute: parts.minute,
+    second: parts.second
+  };
+}
+
+function easternLocalToUtcMs(year, month, day, hour, minute, second = 0) {
+  const desiredAsUtc = Date.UTC(
+    year,
+    month - 1,
+    day,
+    hour,
+    minute,
+    second
+  );
+
+  let guess = desiredAsUtc;
+
+  // Iteratively correct the UTC guess until formatting that timestamp in
+  // America/New_York produces the requested local wall-clock time.
+  for (let i = 0; i < 4; i += 1) {
+    const observed = easternClockParts(guess);
+    const observedAsUtc = Date.UTC(
+      observed.year,
+      observed.month - 1,
+      observed.day,
+      observed.hour,
+      observed.minute,
+      observed.second
+    );
+
+    const delta = desiredAsUtc - observedAsUtc;
+    guess += delta;
+
+    if (Math.abs(delta) < 1000) break;
+  }
+
+  return guess;
+}
+
+function nextRealEastern930Ms(nowMs = Date.now()) {
+  const nowEastern = easternClockParts(nowMs);
+
+  let targetYear = nowEastern.year;
+  let targetMonth = nowEastern.month;
+  let targetDay = nowEastern.day;
+
+  let targetMs = easternLocalToUtcMs(
+    targetYear,
+    targetMonth,
+    targetDay,
+    9,
+    30,
+    0
+  );
+
+  if (targetMs <= nowMs) {
+    // Advance the EASTERN calendar date by one day. Date.UTC is only used as a
+    // convenient civil-date increment; easternLocalToUtcMs resolves the actual
+    // ET offset afterward.
+    const nextCivil = new Date(Date.UTC(
+      targetYear,
+      targetMonth - 1,
+      targetDay + 1,
+      12,
+      0,
+      0
+    ));
+
+    targetYear = nextCivil.getUTCFullYear();
+    targetMonth = nextCivil.getUTCMonth() + 1;
+    targetDay = nextCivil.getUTCDate();
+
+    targetMs = easternLocalToUtcMs(
+      targetYear,
+      targetMonth,
+      targetDay,
+      9,
+      30,
+      0
+    );
+  }
+
+  return targetMs;
+}
+
+function virtualClockFromGameSecond(totalGameSeconds) {
+  const safeGameSeconds = Math.max(
+    0,
+    Math.floor(Number(totalGameSeconds) || 0)
+  );
+
+  const totalMinutes = Math.floor(safeGameSeconds / 60);
+  const gameSecond = safeGameSeconds % 60;
+  const dayIndex = Math.floor(totalMinutes / MINUTES_PER_DAY);
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const minuteOfDay =
+    ((totalMinutes % MINUTES_PER_DAY) + MINUTES_PER_DAY)
+    % MINUTES_PER_DAY;
+
+  const hour = Math.floor(minuteOfDay / 60);
+  const minute = minuteOfDay % 60;
+  const session = sessionForMinute(totalMinutes);
+  const displayHour = ((hour + 11) % 12) + 1;
+  const exactTime =
+    `${displayHour}:${String(minute).padStart(2, "0")}:` +
+    `${String(gameSecond).padStart(2, "0")} ${hour >= 12 ? "PM" : "AM"}`;
+
+  return {
+    totalGameSeconds: safeGameSeconds,
+    totalMinutes,
+    gameSecond,
+    dayIndex,
+    dayOfWeekIndex,
+    dayName: DAY_NAMES[dayOfWeekIndex],
+    week: Math.floor(dayIndex / 7) + 1,
+    minuteOfDay,
+    hour,
+    minute,
+    exactTime,
+    session,
+    label: session === "open"
+      ? "MARKET OPEN"
+      : session === "pre-market"
+        ? "PRE-MARKET"
+        : session === "after-hours"
+          ? "AFTER HOURS"
+          : "MARKET CLOSED",
+    isWeekday: dayOfWeekIndex < 5,
+    isOpen: session !== "closed",
+    isRegularHours: session === "open",
+    isTradingAllowed: session !== "closed",
+    isHoliday: false,
+    holidayName: "",
+    earlyClose: false,
+    earlyCloseName: "",
+    regularCloseMinute: 960,
+    nextEventText: nextSessionText(
+      dayOfWeekIndex,
+      minuteOfDay,
+      session
+    )
+  };
+}
+
+function nextRegularOpenGameSecondAfter(gameSecond) {
+  const safe = Math.max(0, Math.floor(Number(gameSecond) || 0));
+  const currentMinute = Math.floor(safe / 60);
+  const currentDayIndex = Math.floor(currentMinute / MINUTES_PER_DAY);
+
+  for (let offset = 0; offset < 21; offset += 1) {
+    const dayIndex = currentDayIndex + offset;
+    const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+
+    if (dayOfWeekIndex >= 5) continue;
+
+    const openSecond =
+      dayIndex * MINUTES_PER_DAY * 60
+      + 570 * 60;
+
+    if (openSecond > safe) {
+      return openSecond;
+    }
+  }
+
+  return null;
+}
+
+function findForwardClosedAlignmentTarget(
+  currentGameSecond,
+  desiredGameSecondsUntilOpen
+) {
+  const current = Math.max(
+    0,
+    Math.floor(Number(currentGameSecond) || 0)
+  );
+
+  const desired = Math.max(
+    1,
+    Math.round(Number(desiredGameSecondsUntilOpen) || 1)
+  );
+
+  const currentDay = Math.floor(
+    current / (MINUTES_PER_DAY * 60)
+  );
+
+  for (let offset = 0; offset < 28; offset += 1) {
+    const openDay = currentDay + offset;
+    const openWeekday = ((openDay % 7) + 7) % 7;
+
+    if (openWeekday >= 5) continue;
+
+    const openSecond =
+      openDay * MINUTES_PER_DAY * 60
+      + 570 * 60;
+
+    const candidate = openSecond - desired;
+
+    if (candidate <= current) continue;
+
+    const candidateClock = virtualClockFromGameSecond(candidate);
+
+    // Keep the market closed immediately after the jump. Otherwise a minimal
+    // forward phase shift could land in the middle of a regular session, which
+    // would make "next open at 9:30 real" misleading to players.
+    if (candidateClock.session !== "closed") continue;
+
+    const verifiedNextOpen =
+      nextRegularOpenGameSecondAfter(candidate);
+
+    if (verifiedNextOpen === openSecond) {
+      return {
+        targetGameSecond: candidate,
+        nextOpenGameSecond: openSecond,
+        targetClock: candidateClock
+      };
+    }
+  }
+
+  throw new Error(
+    "Could not find a forward closed-market clock phase for the requested real 9:30 alignment."
+  );
+}
+
+function applyVirtualFastForwardStep(clock, elapsedGameMinutes) {
+  const factors = buildMarketFactorStep();
+
+  ensureStockClassifications(marketState);
+  for (const company of Object.values(marketState.companies)) {
+    ensureDailyReferenceForTradingDay(company, clock);
+    updateCompany(
+      company,
+      elapsedGameMinutes,
+      clock,
+      factors
+    );
+  }
+
+  ensureSimulatedCommodityState(marketState);
+  for (const asset of Object.values(marketState.commodities)) {
+    updateSimulatedCommodity(
+      asset,
+      elapsedGameMinutes,
+      clock,
+      factors
+    );
+  }
+
+  ensureSimulatedCryptoState(marketState);
+  for (const asset of Object.values(marketState.cryptos)) {
+    updateSimulatedCrypto(
+      asset,
+      elapsedGameMinutes,
+      clock
+    );
+  }
+
+  // Generate every fictional news event whose scheduled game minute was crossed.
+  // nextNewsGameMinute always moves forward by at least 8 game minutes.
+  while (
+    clock.totalMinutes
+    >= Number(marketState.nextNewsGameMinute || Infinity)
+  ) {
+    generateCompanyNews(clock);
+  }
+
+  marketState.lastIpoWeek = 0;
+
+  // Preserve the exact same fictional 4 PM close behavior as the live engine.
+  if (
+    clock.minuteOfDay >= 960
+    && clock.dayOfWeekIndex < 5
+    && Number(marketState.lastCloseDayIndex) !== clock.dayIndex
+  ) {
+    for (const company of Object.values(marketState.companies)) {
+      company.lastRegularClosePrice =
+        displayedPriceForAsset(company);
+      company.lastRegularCloseDayIndex = clock.dayIndex;
+    }
+
+    marketState.lastCloseDayIndex = clock.dayIndex;
+  }
+
+  marketState.lastUpdatedGameSecond = clock.totalGameSeconds;
+  marketState.lastUpdatedGameMinute = clock.totalMinutes;
+}
+
+function simulateMarketForwardTo(targetGameSecond) {
+  const target = Math.max(
+    0,
+    Math.floor(Number(targetGameSecond) || 0)
+  );
+
+  let cursor = Math.max(
+    0,
+    Math.floor(Number(marketState.lastUpdatedGameSecond) || 0)
+  );
+
+  if (target <= cursor) {
+    return {
+      simulatedGameSeconds: 0,
+      simulatedSteps: 0,
+      simulatedNewsEvents: 0
+    };
+  }
+
+  const startingNewsCount =
+    Number(marketState.news?.length) || 0;
+
+  let steps = 0;
+
+  // One game-minute simulation steps are intentional:
+  // - accurate session/day/week transitions
+  // - accurate daily-close rollover
+  // - correlated market factor generated for each skipped minute
+  // - much cheaper and safer than hundreds of thousands of 1-second startup loops
+  while (cursor < target) {
+    const remaining = target - cursor;
+    const stepSeconds = Math.min(60, remaining);
+    cursor += stepSeconds;
+
+    const clock = virtualClockFromGameSecond(cursor);
+    applyVirtualFastForwardStep(
+      clock,
+      stepSeconds / 60
+    );
+
+    steps += 1;
+  }
+
+  return {
+    simulatedGameSeconds:
+      target
+      - Math.max(
+        0,
+        Math.floor(Number(marketState.clockAlignmentStartGameSecond) || 0)
+      ),
+    simulatedSteps: steps,
+    // News is capped at 120, so this is only the retained-count delta. The log
+    // below separately reports the number of minute simulation steps.
+    retainedNewsCountDelta:
+      (Number(marketState.news?.length) || 0)
+      - startingNewsCount
+  };
+}
+
+function formatAlignmentClock(clock) {
+  return `${clock.dayName} ${clock.exactTime}`;
+}
+
+function performOneTimeReal930Alignment() {
+  if (!marketState || marketState.handoffReady !== true) {
+    return false;
+  }
+
+  if (
+    Number(marketState.marketClockAlignmentVersion)
+    === MARKET_CLOCK_ALIGNMENT_VERSION
+  ) {
+    return false;
+  }
+
+  marketFastForwardInProgress = true;
+
+  try {
+    // First catch the persisted market up to the exact real deployment moment.
+    engineStep();
+
+    const alignmentNowMs = Date.now();
+    const currentClock = marketClock(alignmentNowMs);
+    const nextReal930Ms =
+      nextRealEastern930Ms(alignmentNowMs);
+
+    const realMsUntil930 =
+      Math.max(1, nextReal930Ms - alignmentNowMs);
+
+    const desiredGameSecondsUntilOpen =
+      Math.max(
+        1,
+        Math.round(
+          realMsUntil930
+          * 60
+          / GAME_MS_PER_MINUTE
+        )
+      );
+
+    const alignment =
+      findForwardClosedAlignmentTarget(
+        currentClock.totalGameSeconds,
+        desiredGameSecondsUntilOpen
+      );
+
+    const targetGameSecond =
+      alignment.targetGameSecond;
+
+    marketState.clockAlignmentStartGameSecond =
+      currentClock.totalGameSeconds;
+
+    console.log(
+      `[CLOCK ALIGNMENT] One-time forward alignment starting. ` +
+      `Current fictional time: ${formatAlignmentClock(currentClock)}.`
+    );
+
+    console.log(
+      `[CLOCK ALIGNMENT] Fast-forward target: ` +
+      `${formatAlignmentClock(alignment.targetClock)}. ` +
+      `The next fictional regular open will occur at the next real ` +
+      `9:30 AM ET.`
+    );
+
+    const result =
+      simulateMarketForwardTo(targetGameSecond);
+
+    // Move the clock anchor only AFTER all skipped market state has been
+    // simulated. This avoids one giant elapsed-time engine step.
+    marketState.clockAnchorRealMs = alignmentNowMs;
+    marketState.clockAnchorGameSeconds = targetGameSecond;
+    marketState.lastUpdatedGameSecond = targetGameSecond;
+    marketState.lastUpdatedGameMinute =
+      Math.floor(targetGameSecond / 60);
+
+    marketState.marketClockAlignmentVersion =
+      MARKET_CLOCK_ALIGNMENT_VERSION;
+    marketState.marketClockAlignedAtUnix =
+      Math.floor(alignmentNowMs / 1000);
+    marketState.marketClockAlignedReal930Unix =
+      Math.floor(nextReal930Ms / 1000);
+    marketState.marketClockAlignedTargetGameSecond =
+      targetGameSecond;
+
+    clearAllCandleCaches(marketState);
+
+    console.log(
+      `[CLOCK ALIGNMENT] Simulated ${result.simulatedSteps} ` +
+      `minute/partial-minute market steps before moving the anchor.`
+    );
+
+    console.log(
+      `[CLOCK ALIGNMENT] COMPLETE. This alignment will NOT run again. ` +
+      `The 2x fictional clock now continues normally.`
+    );
+
+    return true;
+  } finally {
+    marketFastForwardInProgress = false;
+    delete marketState.clockAlignmentStartGameSecond;
+    lastPeriodicSaveAt = Date.now();
+    saveStateNow();
   }
 }
 
@@ -3773,6 +4265,10 @@ async function startServer() {
   if (marketState.handoffReady !== true) {
     console.log("[FICTIONAL HANDOFF] Taking exact one-time Yahoo snapshot before opening the fictional market...");
     await attemptAutomaticExactHandoff();
+  }
+
+  if (marketState.handoffReady === true) {
+    performOneTimeReal930Alignment();
   }
 
   setInterval(engineStep, 1000);
