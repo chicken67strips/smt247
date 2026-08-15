@@ -308,14 +308,182 @@ function ensureCryptoCandleSeries(asset, intervalKey) {
   }
 
   if (series.length) {
-    const lastClose = Number(series[series.length - 1].c) || asset.price;
-    const ratio = lastClose > 0 ? asset.price / lastClose : 1;
+    const currentDisplayPrice = Math.max(
+      0.00000001,
+      displayedPriceForAsset(asset)
+    );
+    const actualDayOpen = Math.max(
+      0.00000001,
+      Number(asset.dayOpenPrice) || currentDisplayPrice
+    );
+    const currentDayIndex = Math.floor(nowMinute / MINUTES_PER_DAY);
+    const currentDayStartMinute = currentDayIndex * MINUTES_PER_DAY;
 
-    for (const candle of series) {
-      candle.o = round(candle.o * ratio, 8);
-      candle.h = round(candle.h * ratio, 8);
-      candle.l = round(Math.max(0.00000001, candle.l * ratio), 8);
-      candle.c = round(candle.c * ratio, 8);
+    let currentDayStartIndex = -1;
+
+    for (let i = 0; i < series.length; i += 1) {
+      if (Number(series[i].bucketMinute) >= currentDayStartMinute) {
+        currentDayStartIndex = i;
+        break;
+      }
+    }
+
+    if (currentDayStartIndex >= 0) {
+      // First, scale all older candles so the final pre-midnight close connects
+      // continuously to the ACTUAL fictional day-open price.
+      if (currentDayStartIndex > 0) {
+        const previousClose =
+          Number(series[currentDayStartIndex - 1].c)
+          || actualDayOpen;
+
+        const priorRatio =
+          previousClose > 0
+            ? actualDayOpen / previousClose
+            : 1;
+
+        for (let i = 0; i < currentDayStartIndex; i += 1) {
+          const candle = series[i];
+
+          candle.o = round(candle.o * priorRatio, 8);
+          candle.h = round(candle.h * priorRatio, 8);
+          candle.l = round(
+            Math.max(0.00000001, candle.l * priorRatio),
+            8
+          );
+          candle.c = round(candle.c * priorRatio, 8);
+        }
+      }
+
+      // Preserve the deterministic shape/volatility of today's generated
+      // candles, but adjust their aggregate log return so:
+      //
+      //   first open = persisted fictional day open
+      //   last close = current displayed quote
+      //
+      // This makes the chart and the crypto daily-% badge mathematically
+      // consistent without keeping hundreds of thousands of candle objects in
+      // Railway memory.
+      const todayCount = series.length - currentDayStartIndex;
+      let rawReturnSum = 0;
+
+      for (let i = currentDayStartIndex; i < series.length; i += 1) {
+        const candle = series[i];
+        const rawOpen = Math.max(
+          0.00000001,
+          Number(candle.o) || 0.00000001
+        );
+        const rawClose = Math.max(
+          0.00000001,
+          Number(candle.c) || rawOpen
+        );
+
+        rawReturnSum += Math.log(rawClose / rawOpen);
+      }
+
+      const desiredReturn =
+        Math.log(currentDisplayPrice / actualDayOpen);
+
+      const perCandleCorrection =
+        todayCount > 0
+          ? (desiredReturn - rawReturnSum) / todayCount
+          : 0;
+
+      let rebuiltOpen = actualDayOpen;
+
+      for (let i = currentDayStartIndex; i < series.length; i += 1) {
+        const candle = series[i];
+
+        const rawOpen = Math.max(
+          0.00000001,
+          Number(candle.o) || rebuiltOpen
+        );
+        const rawClose = Math.max(
+          0.00000001,
+          Number(candle.c) || rawOpen
+        );
+        const rawHigh = Math.max(
+          rawOpen,
+          rawClose,
+          Number(candle.h) || rawOpen
+        );
+        const rawLow = Math.max(
+          0.00000001,
+          Math.min(
+            rawOpen,
+            rawClose,
+            Number(candle.l) || rawOpen
+          )
+        );
+
+        const rawBodyReturn =
+          Math.log(rawClose / rawOpen);
+
+        let rebuiltClose =
+          rebuiltOpen
+          * Math.exp(
+            rawBodyReturn + perCandleCorrection
+          );
+
+        if (i === series.length - 1) {
+          rebuiltClose = currentDisplayPrice;
+        }
+
+        const rawUpperBody = Math.max(rawOpen, rawClose);
+        const rawLowerBody = Math.min(rawOpen, rawClose);
+
+        const upperWickFactor =
+          rawUpperBody > 0
+            ? Math.max(1, rawHigh / rawUpperBody)
+            : 1;
+
+        const lowerWickFactor =
+          rawLow > 0
+            ? Math.max(1, rawLowerBody / rawLow)
+            : 1;
+
+        candle.o = round(rebuiltOpen, 8);
+        candle.c = round(
+          Math.max(0.00000001, rebuiltClose),
+          8
+        );
+        candle.h = round(
+          Math.max(candle.o, candle.c)
+            * upperWickFactor,
+          8
+        );
+        candle.l = round(
+          Math.max(
+            0.00000001,
+            Math.min(candle.o, candle.c)
+              / lowerWickFactor
+          ),
+          8
+        );
+
+        rebuiltOpen = candle.c;
+      }
+    } else {
+      // The loaded timeframe does not reach fictional midnight (for example a
+      // 1-minute chart viewed many hours into the day). It cannot display the
+      // entire daily move, so simply anchor its newest candle to the live quote.
+      const lastClose =
+        Number(series[series.length - 1].c)
+        || currentDisplayPrice;
+
+      const ratio =
+        lastClose > 0
+          ? currentDisplayPrice / lastClose
+          : 1;
+
+      for (const candle of series) {
+        candle.o = round(candle.o * ratio, 8);
+        candle.h = round(candle.h * ratio, 8);
+        candle.l = round(
+          Math.max(0.00000001, candle.l * ratio),
+          8
+        );
+        candle.c = round(candle.c * ratio, 8);
+      }
     }
   }
 
@@ -380,10 +548,16 @@ function updateSimulatedCrypto(asset, elapsedGameMinutes, clock) {
 
   if (Number(asset.lastDayIndex) !== clock.dayIndex) {
     asset.lastDayIndex = clock.dayIndex;
+
+    // Daily change and regenerated charts must use the quote players actually
+    // saw at fictional midnight, including any bounded player-order pressure.
     asset.dayOpenPrice = Math.max(
       0.00000001,
-      Number(asset.price) || asset.initialPrice
+      Number(priorDisplayedPrice)
+        || Number(asset.price)
+        || asset.initialPrice
     );
+
     asset.volume24h = 0;
   }
 
@@ -444,10 +618,12 @@ function fictionalCryptoRow(asset) {
     price: round(price, 8),
     executionPrice: round(executionReferencePrice, 8),
     playerImpactPct: round(currentPlayerImpact(asset) * 100, 4),
+    dayOpenPrice: round(dayOpen, 8),
     change24h: round(((price - dayOpen) / dayOpen) * 100, 4),
     volume24h: round(Math.max(0, Number(asset.volume24h) || 0) * price, 2),
     marketCap: round(price * Math.max(1, Number(asset.totalSupply) || 1), 2),
     source: "Godly Capital fictional crypto simulation",
+    cryptoChartModelVersion: 2,
     lastUpdated: Math.floor(Date.now() / 1000)
   };
 }
