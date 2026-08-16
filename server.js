@@ -247,7 +247,17 @@ function makeFictionalCryptoCandle(bucketMinute, open, high, low, close, volume)
     o, h, l, c, v,
     session: "crypto",
     gameDayIndex: dayIndex,
-    gameMinuteOfDay: minuteOfDay
+    gameMinuteOfDay: minuteOfDay,
+    ...(() => {
+      const gameDate = gameDateFromDayIndex(dayIndex);
+      return {
+        gameYear: gameDate.year,
+        gameMonth: gameDate.month,
+        gameMonthName: gameDate.shortMonthName,
+        gameDayOfMonth: gameDate.day,
+        gameDate: gameDate.iso
+      };
+    })()
   };
 }
 
@@ -686,7 +696,7 @@ async function getCryptoCandles(symbol, interval) {
     assetType: "crypto",
     source: "Godly Capital fictional crypto simulation",
     extendedHoursIncluded: true,
-    candles: withRsi(ensureCryptoCandleSeries(asset, interval)),
+    candles: withGameCalendar(withRsi(ensureCryptoCandleSeries(asset, interval))),
     indicators: {
       rsiPeriod: 14,
       rsiSource: "candle-close"
@@ -843,7 +853,17 @@ function makeFictionalCommodityCandle(bucketMinute, open, high, low, close, volu
     o, h, l, c, v,
     session: "commodity",
     gameDayIndex: dayIndex,
-    gameMinuteOfDay: minuteOfDay
+    gameMinuteOfDay: minuteOfDay,
+    ...(() => {
+      const gameDate = gameDateFromDayIndex(dayIndex);
+      return {
+        gameYear: gameDate.year,
+        gameMonth: gameDate.month,
+        gameMonthName: gameDate.shortMonthName,
+        gameDayOfMonth: gameDate.day,
+        gameDate: gameDate.iso
+      };
+    })()
   };
 }
 
@@ -1117,7 +1137,7 @@ async function getCommodityCandles(ticker, interval) {
     assetType: "commodity",
     source: "Godly Capital fictional commodity simulation",
     livePriceCompatible: true,
-    candles: withRsi(ensureCommodityCandleSeries(asset, interval)),
+    candles: withGameCalendar(withRsi(ensureCommodityCandleSeries(asset, interval))),
     indicators: {
       rsiPeriod: 14,
       rsiSource: "candle-close"
@@ -1136,6 +1156,118 @@ async function getCommodityCandles(ticker, interval) {
 const MINUTES_PER_DAY = 1440;
 const MINUTES_PER_WEEK = 10080;
 const DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+
+// ============================
+// Persistent fictional calendar
+// ============================
+// This calendar advances from the same persistent accelerated gameDayIndex as
+// the exchange clock. It is intentionally independent of the real-world date.
+//
+// Game Day 0 = January 1, 2026.
+// Day 0 remains the exchange's fictional Monday regardless of the real weekday.
+const GAME_CALENDAR_START_YEAR = 2026;
+const GAME_CALENDAR_START_MONTH = 1;
+const GAME_CALENDAR_START_DAY = 1;
+const GAME_CALENDAR_MONTH_NAMES = [
+  "January", "February", "March", "April", "May", "June",
+  "July", "August", "September", "October", "November", "December"
+];
+const GAME_CALENDAR_SHORT_MONTH_NAMES = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+];
+const GAME_CALENDAR_MONTH_LENGTHS = [
+  31, 28, 31, 30, 31, 30,
+  31, 31, 30, 31, 30, 31
+];
+
+function isGameCalendarLeapYear(year) {
+  const y = Math.floor(Number(year) || GAME_CALENDAR_START_YEAR);
+  if (y % 400 === 0) return true;
+  if (y % 100 === 0) return false;
+  return y % 4 === 0;
+}
+
+function gameCalendarMonthLength(year, month) {
+  const m = clamp(Math.floor(Number(month) || 1), 1, 12);
+  if (m === 2 && isGameCalendarLeapYear(year)) return 29;
+  return GAME_CALENDAR_MONTH_LENGTHS[m - 1];
+}
+
+function gameDateFromDayIndex(dayIndex) {
+  let remainingDays = Math.max(0, Math.floor(Number(dayIndex) || 0));
+  let year = GAME_CALENDAR_START_YEAR;
+  let month = GAME_CALENDAR_START_MONTH;
+  let day = GAME_CALENDAR_START_DAY;
+
+  const daysLeftInStartMonth = gameCalendarMonthLength(year, month) - day;
+  if (remainingDays <= daysLeftInStartMonth) {
+    day += remainingDays;
+    remainingDays = 0;
+  } else {
+    remainingDays -= daysLeftInStartMonth + 1;
+    month += 1;
+    day = 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+  }
+
+  while (remainingDays > 0) {
+    const monthLength = gameCalendarMonthLength(year, month);
+    if (remainingDays < monthLength) {
+      day = 1 + remainingDays;
+      remainingDays = 0;
+    } else {
+      remainingDays -= monthLength;
+      month += 1;
+      if (month > 12) {
+        month = 1;
+        year += 1;
+      }
+    }
+  }
+
+  const monthName = GAME_CALENDAR_MONTH_NAMES[month - 1];
+  const shortMonthName = GAME_CALENDAR_SHORT_MONTH_NAMES[month - 1];
+
+  return {
+    year,
+    month,
+    day,
+    monthName,
+    shortMonthName,
+    iso: `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`,
+    display: `${monthName} ${day}, ${year}`
+  };
+}
+
+function withGameCalendar(candles) {
+  if (!Array.isArray(candles)) return [];
+  return candles.map(candle => {
+    if (!candle || typeof candle !== "object") return candle;
+
+    let dayIndex = Number(candle.gameDayIndex);
+    if (!Number.isFinite(dayIndex)) {
+      const bucketMinute = Number(candle.bucketMinute);
+      if (Number.isFinite(bucketMinute)) {
+        dayIndex = Math.floor(bucketMinute / MINUTES_PER_DAY);
+      }
+    }
+    if (!Number.isFinite(dayIndex)) return candle;
+
+    const gameDate = gameDateFromDayIndex(dayIndex);
+    return {
+      ...candle,
+      gameYear: gameDate.year,
+      gameMonth: gameDate.month,
+      gameMonthName: gameDate.shortMonthName,
+      gameDayOfMonth: gameDate.day,
+      gameDate: gameDate.iso
+    };
+  });
+}
 const REAL_SECONDS_PER_GAME_MINUTE = clamp(
   Number(process.env.FICTIONAL_REAL_SECONDS_PER_GAME_MINUTE) || 30,
   1,
@@ -2076,6 +2208,7 @@ function marketClock(nowMs = Date.now()) {
   const session = sessionForMinute(totalMinutes);
   const displayHour = ((hour + 11) % 12) + 1;
   const exactTime = `${displayHour}:${String(minute).padStart(2, "0")}:${String(gameSecond).padStart(2, "0")} ${hour >= 12 ? "PM" : "AM"}`;
+  const gameDate = gameDateFromDayIndex(dayIndex);
 
   return {
     totalGameSeconds,
@@ -2085,6 +2218,13 @@ function marketClock(nowMs = Date.now()) {
     dayOfWeekIndex,
     dayName: DAY_NAMES[dayOfWeekIndex],
     week: Math.floor(dayIndex / 7) + 1,
+    gameYear: gameDate.year,
+    gameMonth: gameDate.month,
+    gameMonthName: gameDate.monthName,
+    gameMonthShortName: gameDate.shortMonthName,
+    gameDayOfMonth: gameDate.day,
+    gameDate: gameDate.iso,
+    gameDateText: gameDate.display,
     minuteOfDay,
     hour,
     minute,
@@ -2884,7 +3024,17 @@ function candleRecord(bucketMinute, open, high, low, close, volume, session) {
     o, h, l, c, v,
     session,
     gameDayIndex: dayIndex,
-    gameMinuteOfDay: minuteOfDay
+    gameMinuteOfDay: minuteOfDay,
+    ...(() => {
+      const gameDate = gameDateFromDayIndex(dayIndex);
+      return {
+        gameYear: gameDate.year,
+        gameMonth: gameDate.month,
+        gameMonthName: gameDate.shortMonthName,
+        gameDayOfMonth: gameDate.day,
+        gameDate: gameDate.iso
+      };
+    })()
   };
 }
 
@@ -3372,6 +3522,7 @@ function virtualClockFromGameSecond(totalGameSeconds) {
   const exactTime =
     `${displayHour}:${String(minute).padStart(2, "0")}:` +
     `${String(gameSecond).padStart(2, "0")} ${hour >= 12 ? "PM" : "AM"}`;
+  const gameDate = gameDateFromDayIndex(dayIndex);
 
   return {
     totalGameSeconds: safeGameSeconds,
@@ -3381,6 +3532,13 @@ function virtualClockFromGameSecond(totalGameSeconds) {
     dayOfWeekIndex,
     dayName: DAY_NAMES[dayOfWeekIndex],
     week: Math.floor(dayIndex / 7) + 1,
+    gameYear: gameDate.year,
+    gameMonth: gameDate.month,
+    gameMonthName: gameDate.monthName,
+    gameMonthShortName: gameDate.shortMonthName,
+    gameDayOfMonth: gameDate.day,
+    gameDate: gameDate.iso,
+    gameDateText: gameDate.display,
     minuteOfDay,
     hour,
     minute,
@@ -4221,7 +4379,7 @@ app.get("/fictional/candles", (req, res) => {
     interval,
     fictional: true,
     companyName: company.name,
-    candles: withRsi(ensureCandleSeries(company, interval)),
+    candles: withGameCalendar(withRsi(ensureCandleSeries(company, interval))),
     indicators: { rsiPeriod: 14, rsiSource: "candle-close" }
   });
 });
