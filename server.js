@@ -1195,40 +1195,20 @@ function gameCalendarMonthLength(year, month) {
 }
 
 function gameDateFromDayIndex(dayIndex) {
-  let remainingDays = Math.max(0, Math.floor(Number(dayIndex) || 0));
-  let year = GAME_CALENDAR_START_YEAR;
-  let month = GAME_CALENDAR_START_MONTH;
-  let day = GAME_CALENDAR_START_DAY;
+  // UTC Gregorian arithmetic supports negative fictional day indices too.
+  // That lets the initial 220-day 1D backstory use real prior month/day labels
+  // instead of clamping every pre-Day-0 candle onto Jan 1.
+  const offset = Math.floor(Number(dayIndex) || 0);
+  const date = new Date(Date.UTC(
+    GAME_CALENDAR_START_YEAR,
+    GAME_CALENDAR_START_MONTH - 1,
+    GAME_CALENDAR_START_DAY
+  ));
+  date.setUTCDate(date.getUTCDate() + offset);
 
-  const daysLeftInStartMonth = gameCalendarMonthLength(year, month) - day;
-  if (remainingDays <= daysLeftInStartMonth) {
-    day += remainingDays;
-    remainingDays = 0;
-  } else {
-    remainingDays -= daysLeftInStartMonth + 1;
-    month += 1;
-    day = 1;
-    if (month > 12) {
-      month = 1;
-      year += 1;
-    }
-  }
-
-  while (remainingDays > 0) {
-    const monthLength = gameCalendarMonthLength(year, month);
-    if (remainingDays < monthLength) {
-      day = 1 + remainingDays;
-      remainingDays = 0;
-    } else {
-      remainingDays -= monthLength;
-      month += 1;
-      if (month > 12) {
-        month = 1;
-        year += 1;
-      }
-    }
-  }
-
+  const year = date.getUTCFullYear();
+  const month = date.getUTCMonth() + 1;
+  const day = date.getUTCDate();
   const monthName = GAME_CALENDAR_MONTH_NAMES[month - 1];
   const shortMonthName = GAME_CALENDAR_SHORT_MONTH_NAMES[month - 1];
 
@@ -2363,6 +2343,8 @@ function companyFromSeed(seed, listedGameMinute = 0) {
     temporaryGrowthUntil: 0,
     buyVolume: 0,
     sellVolume: 0,
+    dailyHistoryVersion: 0,
+    dailyHistory: [],
     candles: {}
   };
 }
@@ -2538,6 +2520,8 @@ function applyExactHandoffPrices(inputRows, source = "Roblox realistic-market ha
       : 0;
 
     company.candles = {};
+    company.dailyHistory = [];
+    company.dailyHistoryVersion = 0;
     company.handoffPrice = livePrice;
     company.handoffPrevClose = item.prevClose;
     company.handoffAt = nowUnix;
@@ -2909,6 +2893,23 @@ function loadState() {
 
     const clock = marketClock();
 
+    let dailyHistoryMigrationCount = 0;
+    for (const company of Object.values(marketState.companies || {})) {
+      const beforeVersion = Number(company.dailyHistoryVersion) || 0;
+      ensureStockDailyHistory(company, clock);
+      if (beforeVersion !== STOCK_DAILY_HISTORY_VERSION) {
+        dailyHistoryMigrationCount += 1;
+      }
+    }
+
+    if (dailyHistoryMigrationCount > 0) {
+      console.log(
+        `[FICTIONAL DAILY HISTORY] Initialized persistent 1D history for ` +
+        `${dailyHistoryMigrationCount} stock(s).`
+      );
+      saveStateNow();
+    }
+
     if (Number(marketState.dailyChangeModelVersion) !== DAILY_CHANGE_MODEL_VERSION) {
       let rebasedCount = 0;
 
@@ -2948,6 +2949,10 @@ function loadState() {
     return false;
   } catch (error) {
     marketState = newMarketState();
+    const freshClock = marketClock();
+    for (const company of Object.values(marketState.companies || {})) {
+      ensureStockDailyHistory(company, freshClock);
+    }
     saveStateNow();
     console.log(`[FICTIONAL] Started a new ${INITIAL_COMPANIES.length}-company main-game market (${error.code || error.message}).`);
     return true;
@@ -3137,7 +3142,7 @@ function companyRow(company, clock = marketClock()) {
 }
 
 function candleRecord(bucketMinute, open, high, low, close, volume, session) {
-  const safeBucket = Math.max(0, Math.floor(Number(bucketMinute) || 0));
+  const safeBucket = Math.floor(Number(bucketMinute) || 0);
   const dayIndex = Math.floor(safeBucket / MINUTES_PER_DAY);
   const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
   const minuteOfDay = ((safeBucket % MINUTES_PER_DAY) + MINUTES_PER_DAY) % MINUTES_PER_DAY;
@@ -3169,8 +3174,348 @@ function candleRecord(bucketMinute, open, high, low, close, volume, session) {
   };
 }
 
+const STOCK_DAILY_HISTORY_VERSION = 1;
+const STOCK_DAILY_HISTORY_LIMIT = FICTIONAL_INTERVALS["1d"].limit;
+
+function stockTradingDayIndex(dayIndex) {
+  return ((Math.floor(Number(dayIndex) || 0) % 7) + 7) % 7;
+}
+
+function stockTradingDaysEndingAt(dayIndex, limit = STOCK_DAILY_HISTORY_LIMIT) {
+  const out = [];
+  let cursor = Math.floor(Number(dayIndex) || 0);
+  let safety = 0;
+
+  while (out.length < limit && safety < limit * 3) {
+    if (stockTradingDayIndex(cursor) < 5) out.push(cursor);
+    cursor -= 1;
+    safety += 1;
+  }
+
+  out.reverse();
+  return out;
+}
+
+function stockDailyReturn(company, dayIndex) {
+  const annualGrowth = Number(company.annualGrowth) || 0;
+  const annualVolatility = Math.max(
+    0.001,
+    Number(company.annualVolatility) || 0.20
+  );
+  const bucket = dayIndex * MINUTES_PER_DAY + 960;
+  const factor = historicalStockFactor(company, bucket);
+
+  return annualGrowth / 252
+    + factor * annualVolatility / Math.sqrt(252);
+}
+
+function makeStockDailyCandle(company, dayIndex, open, close) {
+  const annualVolatility = Math.max(
+    0.001,
+    Number(company.annualVolatility) || 0.20
+  );
+  const dailyScale = annualVolatility / Math.sqrt(252);
+  const bucket = dayIndex * MINUTES_PER_DAY;
+  const wickFactor = Math.abs(
+    seededNormal(`persisted-daily-wick:${company.ticker}:${dayIndex}`)
+  );
+
+  const base = Math.max(0.05, Math.max(open, close));
+  const wick = base
+    * dailyScale
+    * (0.16 + Math.min(1.75, wickFactor) * 0.34);
+
+  const volumeUnit = seededUnit(
+    `persisted-daily-volume:${company.ticker}:${dayIndex}`
+  );
+  const volume = 18000 + volumeUnit * 120000;
+
+  return candleRecord(
+    bucket,
+    Math.max(0.05, open),
+    Math.max(open, close) + wick,
+    Math.max(0.01, Math.min(open, close) - wick),
+    Math.max(0.05, close),
+    volume,
+    "regular"
+  );
+}
+
+function bootstrapStockDailyHistory(company, clock) {
+  const currentPrice = Math.max(
+    0.05,
+    Number(displayedPriceForAsset(company))
+      || Number(company.price)
+      || Number(company.handoffPrice)
+      || Number(company.initialPrice)
+      || 1
+  );
+
+  const days = stockTradingDaysEndingAt(
+    clock?.dayIndex ?? marketClock().dayIndex,
+    STOCK_DAILY_HISTORY_LIMIT
+  );
+  if (!days.length) return [];
+
+  const closes = new Array(days.length);
+  const dayZeroIndex = days.indexOf(0);
+  const handoffPrice = Math.max(
+    0.05,
+    Number(company.handoffPrice)
+      || Number(company.initialPrice)
+      || currentPrice
+  );
+
+  if (dayZeroIndex >= 0) {
+    closes[dayZeroIndex] = handoffPrice;
+
+    for (let i = dayZeroIndex - 1; i >= 0; i -= 1) {
+      const forwardReturn = stockDailyReturn(company, days[i + 1]);
+      closes[i] = Math.max(
+        0.05,
+        closes[i + 1] / Math.exp(forwardReturn)
+      );
+    }
+
+    const forwardCount = days.length - 1 - dayZeroIndex;
+    if (forwardCount > 0) {
+      const rawReturns = [];
+      let rawSum = 0;
+
+      for (let i = dayZeroIndex + 1; i < days.length; i += 1) {
+        const r = stockDailyReturn(company, days[i]);
+        rawReturns.push(r);
+        rawSum += r;
+      }
+
+      const targetLogReturn = Math.log(currentPrice / handoffPrice);
+      const correction = (targetLogReturn - rawSum) / forwardCount;
+      let running = handoffPrice;
+
+      for (let i = dayZeroIndex + 1; i < days.length; i += 1) {
+        running = Math.max(
+          0.05,
+          running * Math.exp(
+            rawReturns[i - dayZeroIndex - 1] + correction
+          )
+        );
+        closes[i] = running;
+      }
+    } else {
+      closes[dayZeroIndex] = currentPrice;
+    }
+  } else {
+    closes[days.length - 1] = currentPrice;
+    for (let i = days.length - 2; i >= 0; i -= 1) {
+      const forwardReturn = stockDailyReturn(company, days[i + 1]);
+      closes[i] = Math.max(
+        0.05,
+        closes[i + 1] / Math.exp(forwardReturn)
+      );
+    }
+  }
+
+  closes[closes.length - 1] = currentPrice;
+
+  const history = [];
+  for (let i = 0; i < days.length; i += 1) {
+    const close = Math.max(
+      0.05,
+      Number(closes[i]) || currentPrice
+    );
+    const open = i > 0
+      ? Math.max(0.05, Number(closes[i - 1]) || close)
+      : Math.max(
+          0.05,
+          close / Math.exp(stockDailyReturn(company, days[i]))
+        );
+
+    history.push(
+      makeStockDailyCandle(company, days[i], open, close)
+    );
+  }
+
+  // One-time bootstrap only: ensure a realistic prior trading range exists.
+  // After this migration, every daily candle is authoritative and persistent.
+  if (history.length >= 20) {
+    const annualVolatility = Math.max(
+      0.001,
+      Number(company.annualVolatility) || 0.20
+    );
+    const peakPct = clamp(annualVolatility * 0.35, 0.018, 0.085);
+    const troughPct = clamp(annualVolatility * 0.30, 0.016, 0.075);
+    const usable = Math.max(1, history.length - 10);
+
+    const peakIndex = Math.min(
+      history.length - 6,
+      4 + Math.floor(
+        seededUnit(`persisted-daily-peak-index:${company.ticker}`)
+        * usable
+      )
+    );
+
+    const troughIndex = Math.min(
+      history.length - 6,
+      4 + Math.floor(
+        seededUnit(`persisted-daily-trough-index:${company.ticker}`)
+        * usable
+      )
+    );
+
+    history[peakIndex].h = round(
+      Math.max(
+        history[peakIndex].h,
+        currentPrice * (1 + peakPct)
+      ),
+      4
+    );
+
+    history[troughIndex].l = round(
+      Math.max(
+        0.01,
+        Math.min(
+          history[troughIndex].l,
+          currentPrice * (1 - troughPct)
+        )
+      ),
+      4
+    );
+  }
+
+  return history.slice(-STOCK_DAILY_HISTORY_LIMIT);
+}
+
+function ensureStockDailyHistory(company, clock = marketClock()) {
+  company.dailyHistory = Array.isArray(company.dailyHistory)
+    ? company.dailyHistory
+    : [];
+
+  if (
+    Number(company.dailyHistoryVersion) !== STOCK_DAILY_HISTORY_VERSION
+    || company.dailyHistory.length === 0
+  ) {
+    const cached = Array.isArray(company.candles?.["1d"])
+      ? company.candles["1d"]
+      : [];
+
+    const distinctCachedDays = new Set(
+      cached
+        .map(c => Number(c?.gameDayIndex))
+        .filter(Number.isFinite)
+    );
+
+    if (cached.length >= 2 && distinctCachedDays.size >= 2) {
+      company.dailyHistory = cached
+        .map(c => ({ ...c }))
+        .slice(-STOCK_DAILY_HISTORY_LIMIT);
+    } else {
+      company.dailyHistory = bootstrapStockDailyHistory(
+        company,
+        clock
+      );
+    }
+
+    company.dailyHistoryVersion = STOCK_DAILY_HISTORY_VERSION;
+    queueSave(50);
+  }
+
+  return company.dailyHistory;
+}
+
+function updateStockDailyHistory(
+  company,
+  priorPrice,
+  currentPrice,
+  clock,
+  playerVolume = 0,
+  elapsedGameMinutes = 0
+) {
+  if (!clock || clock.dayOfWeekIndex >= 5) return;
+
+  const history = ensureStockDailyHistory(company, clock);
+  const dayIndex = clock.dayIndex;
+  const bucket = dayIndex * MINUTES_PER_DAY;
+  const current = history[history.length - 1];
+
+  const safePrior = Math.max(
+    0.05,
+    Number(priorPrice)
+      || Number(current?.c)
+      || Number(currentPrice)
+      || 1
+  );
+  const safeCurrent = Math.max(
+    0.05,
+    Number(currentPrice) || safePrior
+  );
+
+  const naturalVolume = (120 + Math.random() * 900)
+    * Math.max(0, Number(elapsedGameMinutes) || 0);
+  const addedVolume =
+    Math.max(0, Number(playerVolume) || 0) + naturalVolume;
+
+  if (!current || Number(current.gameDayIndex) !== dayIndex) {
+    history.push(
+      candleRecord(
+        bucket,
+        safePrior,
+        Math.max(safePrior, safeCurrent),
+        Math.min(safePrior, safeCurrent),
+        safeCurrent,
+        Math.max(1, addedVolume),
+        "regular"
+      )
+    );
+  } else {
+    current.h = round(
+      Math.max(
+        Number(current.h) || safePrior,
+        safePrior,
+        safeCurrent
+      ),
+      4
+    );
+    current.l = round(
+      Math.max(
+        0.01,
+        Math.min(
+          Number(current.l) || safePrior,
+          safePrior,
+          safeCurrent
+        )
+      ),
+      4
+    );
+    current.c = round(safeCurrent, 4);
+    current.v = Math.round(
+      (Number(current.v) || 0) + addedVolume
+    );
+    current.session = clock.session;
+  }
+
+  while (history.length > STOCK_DAILY_HISTORY_LIMIT) {
+    history.shift();
+  }
+
+  company.dailyHistory = history;
+  company.dailyHistoryVersion = STOCK_DAILY_HISTORY_VERSION;
+
+  company.candles = company.candles || {};
+  if (company.candles["1d"]) {
+    company.candles["1d"] = history;
+    touchCandleSeries("stock", company.ticker, "1d");
+  }
+}
+
 function ensureCandleSeries(company, intervalKey) {
   company.candles = company.candles || {};
+
+  if (intervalKey === "1d") {
+    const history = ensureStockDailyHistory(company, marketClock());
+    company.candles["1d"] = history;
+    touchCandleSeries("stock", company.ticker, "1d");
+    return history;
+  }
 
   if (Array.isArray(company.candles[intervalKey]) && company.candles[intervalKey].length) {
     touchCandleSeries("stock", company.ticker, intervalKey);
@@ -3234,6 +3579,7 @@ function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elap
   for (const [intervalKey, series] of candleEntries) {
     const spec = FICTIONAL_INTERVALS[intervalKey];
     if (!spec || !Array.isArray(series) || series.length === 0) continue;
+    if (intervalKey === "1d") continue;
     const bucket = Math.floor(clock.totalMinutes / spec.minutes) * spec.minutes;
     const current = series[series.length - 1];
     const currentBucket = current ? Number(current.bucketMinute) : null;
@@ -3314,10 +3660,21 @@ function updateCompany(company, elapsedGameMinutes, clock, factors) {
     company.price * Math.exp(randomMove + fairPull)
   );
 
+  const currentDisplayedPrice = displayedPriceForAsset(company);
+
+  updateStockDailyHistory(
+    company,
+    priorDisplayedPrice,
+    currentDisplayedPrice,
+    clock,
+    0,
+    elapsedGameMinutes
+  );
+
   updateCandles(
     company,
     priorDisplayedPrice,
-    displayedPriceForAsset(company),
+    currentDisplayedPrice,
     clock,
     0,
     elapsedGameMinutes
@@ -4679,6 +5036,15 @@ app.post("/fictional/trade", (req, res) => {
   if (assetType === "stock") {
     if (side === "buy") asset.buyVolume += quantity;
     else asset.sellVolume += quantity;
+
+    updateStockDailyHistory(
+      asset,
+      priorDisplayPrice,
+      newDisplayPrice,
+      clock,
+      quantity,
+      0
+    );
 
     updateCandles(
       asset,
