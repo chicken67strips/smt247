@@ -2893,6 +2893,18 @@ function loadState() {
 
     const clock = marketClock();
 
+    const correctedEtfs = applyEtfStabilityMigration(
+      marketState,
+      clock
+    );
+    if (correctedEtfs > 0) {
+      console.log(
+        `[ETF STABILITY] Corrected ${correctedEtfs} legacy ETF price(s) ` +
+        `before rebuilding persistent 1D history.`
+      );
+      saveStateNow();
+    }
+
     let dailyHistoryMigrationCount = 0;
     for (const company of Object.values(marketState.companies || {})) {
       const beforeVersion = Number(company.dailyHistoryVersion) || 0;
@@ -2950,6 +2962,7 @@ function loadState() {
   } catch (error) {
     marketState = newMarketState();
     const freshClock = marketClock();
+    applyEtfStabilityMigration(marketState, freshClock);
     for (const company of Object.values(marketState.companies || {})) {
       ensureStockDailyHistory(company, freshClock);
     }
@@ -3607,6 +3620,248 @@ function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elap
   }
 }
 
+const ETF_STABILITY_MODEL_VERSION = 1;
+
+function isLongTermEtf(company) {
+  const category = String(company?.category || "");
+  return category === "Broad Market ETF"
+    || category === "Defensive Dividend ETF";
+}
+
+function etfTradingYearsSinceHandoff(clock) {
+  if (!clock) return 0;
+
+  const dayIndex = Math.max(0, Math.floor(Number(clock.dayIndex) || 0));
+  let tradingDays = 0;
+
+  // Day 0 is the original real-price handoff day. Count only fictional
+  // Monday-Friday sessions because ETF price evolution only occurs while the
+  // stock market is tradeable.
+  for (let day = 0; day < dayIndex; day += 1) {
+    if (((day % 7) + 7) % 7 < 5) {
+      tradingDays += 1;
+    }
+  }
+
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  if (dayOfWeekIndex < 5) {
+    // Stocks trade 4:00 AM-8:00 PM in the fictional schedule: 960 minutes.
+    const activeMinutes = clamp(
+      (Number(clock.minuteOfDay) || 0) - 240,
+      0,
+      960
+    );
+    tradingDays += activeMinutes / 960;
+  }
+
+  return tradingDays / 252;
+}
+
+function etfTrendPrice(company, clock) {
+  const handoff = Math.max(
+    0.05,
+    Number(company?.handoffPrice)
+      || Number(company?.initialPrice)
+      || Number(company?.price)
+      || 1
+  );
+
+  const years = etfTradingYearsSinceHandoff(clock);
+  const growth = Number(company?.annualGrowth) || 0;
+
+  return Math.max(
+    0.05,
+    handoff * Math.exp(growth * years)
+  );
+}
+
+function applyEtfStabilityMigration(state, clock) {
+  if (!state?.companies) return 0;
+
+  let changed = 0;
+
+  for (const company of Object.values(state.companies)) {
+    const classification = classifyStock(company.ticker, company.sector);
+    company.sector = classification.sector;
+    company.category = classification.category;
+    company.subcategory = classification.subcategory;
+    company.industry = classification.industry;
+
+    if (!isLongTermEtf(company)) continue;
+    if (
+      Number(company.etfStabilityModelVersion)
+      >= ETF_STABILITY_MODEL_VERSION
+    ) {
+      continue;
+    }
+
+    const currentDisplayed = Math.max(
+      0.05,
+      Number(displayedPriceForAsset(company))
+        || Number(company.price)
+        || 1
+    );
+    const trend = etfTrendPrice(company, clock);
+    const years = Math.max(
+      1 / 252,
+      etfTradingYearsSinceHandoff(clock)
+    );
+    const annualVol = Math.max(
+      0.01,
+      Number(company.annualVolatility) || 0.14
+    );
+
+    // Three-sigma envelope around the ETF's long-term trend. This is wide
+    // enough for a real correction/rally, but prevents bugs/random company
+    // events from turning VSS/CHHD into meme stocks.
+    const maxLogDeviation = Math.max(
+      0.08,
+      3.0 * annualVol * Math.sqrt(years)
+    );
+
+    const currentLogDeviation = Math.log(
+      currentDisplayed / Math.max(0.05, trend)
+    );
+    const correctedLogDeviation = clamp(
+      currentLogDeviation,
+      -maxLogDeviation,
+      maxLogDeviation
+    );
+    const correctedDisplayed = Math.max(
+      0.05,
+      trend * Math.exp(correctedLogDeviation)
+    );
+
+    const overlayMultiplier = Math.exp(currentPlayerImpact(company));
+    const correctedBase = correctedDisplayed / Math.max(
+      0.000001,
+      overlayMultiplier
+    );
+
+    const relativeCorrection = Math.abs(
+      correctedDisplayed / currentDisplayed - 1
+    );
+
+    if (relativeCorrection > 0.0005) {
+      console.log(
+        `[ETF STABILITY] ${company.ticker}: correcting impossible legacy ` +
+        `move $${currentDisplayed.toFixed(2)} -> ` +
+        `$${correctedDisplayed.toFixed(2)} ` +
+        `(trend $${trend.toFixed(2)}, ` +
+        `3σ band ${(maxLogDeviation * 100).toFixed(1)}%).`
+      );
+
+      company.price = Math.max(0.05, correctedBase);
+      company.companyValue = Math.max(
+        2e6,
+        company.price
+          * Math.max(1, Number(company.sharesOutstanding) || 1)
+      );
+
+      // The persisted 1D history may have been bootstrapped from the already
+      // inflated legacy price. Rebuild it ONCE from the corrected price.
+      company.dailyHistory = [];
+      company.dailyHistoryVersion = 0;
+      company.candles = company.candles || {};
+      delete company.candles["1d"];
+
+      changed += 1;
+    }
+
+    company.etfStabilityModelVersion =
+      ETF_STABILITY_MODEL_VERSION;
+  }
+
+  return changed;
+}
+
+function updateEtfCompany(company, elapsedGameMinutes, clock, factors) {
+  if (!(elapsedGameMinutes > 0)) return;
+
+  const priorDisplayedPrice = displayedPriceForAsset(company);
+  decayPlayerImpact(company, elapsedGameMinutes);
+
+  if (!clock.isTradingAllowed) return;
+
+  const sharedFactor = stockFactorFromRuntime(company, factors);
+  const effectiveGrowth =
+    company.annualGrowth
+    + (
+      clock.totalMinutes < Number(company.temporaryGrowthUntil || 0)
+        ? Number(company.temporaryGrowth || 0)
+        : 0
+    );
+
+  // Positive long-term price drift. CHHD's larger dividend yield means its
+  // PRICE growth is intentionally slower than VSS even though total return is
+  // similar.
+  const drift =
+    effectiveGrowth
+    * elapsedGameMinutes
+    / (252 * 960);
+
+  // ETF volatility remains real: they can dip, correct, and have bad weeks.
+  // They just no longer receive single-company style shocks.
+  const randomMove =
+    company.annualVolatility
+    * (clock.session === "open" ? 1 : 0.52)
+    * sharedFactor
+    * Math.sqrt(elapsedGameMinutes / (252 * 960));
+
+  // Weak long-horizon pull toward the intended upward ETF trend. This does NOT
+  // prevent normal drawdowns; it prevents a broad/dividend ETF from drifting
+  // 40-60% away from its intended long-run path because of accumulated noise.
+  const trend = etfTrendPrice(company, clock);
+  const currentBase = Math.max(0.05, Number(company.price) || 0.05);
+  const logDeviation = Math.log(currentBase / Math.max(0.05, trend));
+
+  const halfLifeTradingDays =
+    company.category === "Broad Market ETF" ? 55 : 45;
+
+  const reversionStrength = clamp(
+    Math.LN2
+      * elapsedGameMinutes
+      / (halfLifeTradingDays * 960),
+    0,
+    0.08
+  );
+
+  const trendPull = -logDeviation * reversionStrength;
+
+  company.price = Math.max(
+    0.05,
+    currentBase * Math.exp(drift + randomMove + trendPull)
+  );
+
+  // For these ETF stand-ins, NAV/company value follows the fund price instead
+  // of receiving unrelated corporate-value shocks.
+  company.companyValue = Math.max(
+    2e6,
+    company.price
+      * Math.max(1, Number(company.sharesOutstanding) || 1)
+  );
+
+  const currentDisplayedPrice = displayedPriceForAsset(company);
+
+  updateStockDailyHistory(
+    company,
+    priorDisplayedPrice,
+    currentDisplayedPrice,
+    clock,
+    0,
+    elapsedGameMinutes
+  );
+
+  updateCandles(
+    company,
+    priorDisplayedPrice,
+    currentDisplayedPrice,
+    clock,
+    0,
+    elapsedGameMinutes
+  );
+}
+
 function updateCompany(company, elapsedGameMinutes, clock, factors) {
   if (!(elapsedGameMinutes > 0)) return;
 
@@ -3618,6 +3873,16 @@ function updateCompany(company, elapsedGameMinutes, clock, factors) {
   company.category = classification.category;
   company.subcategory = classification.subcategory;
   company.industry = classification.industry;
+
+  if (isLongTermEtf(company)) {
+    updateEtfCompany(
+      company,
+      elapsedGameMinutes,
+      clock,
+      factors
+    );
+    return;
+  }
 
   const effectiveGrowth =
     company.annualGrowth
@@ -3699,7 +3964,11 @@ function newsTemplate(positive) {
 }
 
 function generateCompanyNews(clock) {
-  const companies = Object.values(marketState.companies);
+  // VSS/CHHD are diversified ETF stand-ins. Corporate events such as customer
+  // contracts, product delays, or earnings misses should not directly reprice
+  // the entire fund by several percent.
+  const companies = Object.values(marketState.companies)
+    .filter(company => !isLongTermEtf(company));
   if (!companies.length) return;
   const company = companies[Math.floor(Math.random() * companies.length)];
   const positive = Math.random() < (company.annualGrowth < 0 ? 0.38 : 0.55);
