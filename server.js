@@ -2899,8 +2899,8 @@ function loadState() {
     );
     if (correctedEtfs > 0) {
       console.log(
-        `[ETF STABILITY] Corrected ${correctedEtfs} legacy ETF price(s) ` +
-        `before rebuilding persistent 1D history.`
+        `[ETF NATURAL MOVEMENT] Migrated ${correctedEtfs} ETF(s) ` +
+        `to natural stochastic price/history model.`
       );
       saveStateNow();
     }
@@ -3421,6 +3421,15 @@ function ensureStockDailyHistory(company, clock = marketClock()) {
       company.dailyHistory = cached
         .map(c => ({ ...c }))
         .slice(-STOCK_DAILY_HISTORY_LIMIT);
+    } else if (
+      typeof isLongTermEtf === "function"
+      && isLongTermEtf(company)
+      && typeof buildNaturalEtfHistory === "function"
+    ) {
+      company.dailyHistory = buildNaturalEtfHistory(
+        company,
+        clock
+      );
     } else {
       company.dailyHistory = bootstrapStockDailyHistory(
         company,
@@ -3620,7 +3629,8 @@ function updateCandles(company, priorPrice, price, clock, playerVolume = 0, elap
   }
 }
 
-const ETF_STABILITY_MODEL_VERSION = 1;
+const ETF_STABILITY_MODEL_VERSION = 2;
+const ETF_NATURAL_HISTORY_VERSION = 2;
 
 function isLongTermEtf(company) {
   const category = String(company?.category || "");
@@ -3631,12 +3641,12 @@ function isLongTermEtf(company) {
 function etfTradingYearsSinceHandoff(clock) {
   if (!clock) return 0;
 
-  const dayIndex = Math.max(0, Math.floor(Number(clock.dayIndex) || 0));
+  const dayIndex = Math.max(
+    0,
+    Math.floor(Number(clock.dayIndex) || 0)
+  );
   let tradingDays = 0;
 
-  // Day 0 is the original real-price handoff day. Count only fictional
-  // Monday-Friday sessions because ETF price evolution only occurs while the
-  // stock market is tradeable.
   for (let day = 0; day < dayIndex; day += 1) {
     if (((day % 7) + 7) % 7 < 5) {
       tradingDays += 1;
@@ -3645,7 +3655,7 @@ function etfTradingYearsSinceHandoff(clock) {
 
   const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
   if (dayOfWeekIndex < 5) {
-    // Stocks trade 4:00 AM-8:00 PM in the fictional schedule: 960 minutes.
+    // Stocks are tradeable from 4:00 AM through 8:00 PM in-game.
     const activeMinutes = clamp(
       (Number(clock.minuteOfDay) || 0) - 240,
       0,
@@ -3675,101 +3685,290 @@ function etfTrendPrice(company, clock) {
   );
 }
 
+function naturalEtfDailyFactor(company, dayIndex) {
+  const day = Math.floor(Number(dayIndex) || 0);
+
+  // A modest amount of serial correlation creates realistic multi-day runs
+  // without turning the chart into a straight trend line.
+  const marketFactor = weightedFactor([
+    [seededNormal(`etf-market:${day}`), 0.88],
+    [seededNormal(`etf-market:${day - 1}`), 0.24],
+    [seededNormal(`etf-market:${day - 2}`), 0.10]
+  ]);
+
+  const defensiveFactor = weightedFactor([
+    [seededNormal(`etf-defensive:${day}`), 0.84],
+    [seededNormal(`etf-defensive:${day - 1}`), 0.22]
+  ]);
+
+  const idiosyncratic = seededNormal(
+    `etf-idio:${company.ticker}:${day}`
+  );
+
+  if (company.category === "Broad Market ETF") {
+    return weightedFactor([
+      [marketFactor, 0.90],
+      [idiosyncratic, 0.20]
+    ]);
+  }
+
+  return weightedFactor([
+    [marketFactor, 0.52],
+    [defensiveFactor, 0.70],
+    [idiosyncratic, 0.15]
+  ]);
+}
+
+function naturalEtfDailyLogReturn(company, dayIndex, progress = 1) {
+  const safeProgress = clamp(Number(progress) || 0, 0, 1);
+  if (safeProgress <= 0) return 0;
+
+  const annualGrowth = Number(company.annualGrowth) || 0;
+  const annualVolatility = Math.max(
+    0.01,
+    Number(company.annualVolatility) || 0.14
+  );
+
+  // Drift scales linearly with time; random volatility scales with sqrt(time).
+  let logReturn =
+    annualGrowth / 252 * safeProgress
+    + annualVolatility
+      / Math.sqrt(252)
+      * naturalEtfDailyFactor(company, dayIndex)
+      * Math.sqrt(safeProgress);
+
+  // Rare market-style shock days. These are deliberately uncommon and much
+  // smaller than the old single-company news shocks.
+  const jumpChance = seededUnit(
+    `etf-jump:${company.ticker}:${Math.floor(Number(dayIndex) || 0)}`
+  );
+  const jumpMagnitude = seededUnit(
+    `etf-jump-mag:${company.ticker}:${Math.floor(Number(dayIndex) || 0)}`
+  );
+
+  if (jumpChance < 0.008) {
+    logReturn -= (0.012 + 0.016 * jumpMagnitude)
+      * Math.sqrt(safeProgress);
+  } else if (jumpChance > 0.992) {
+    logReturn += (0.009 + 0.013 * jumpMagnitude)
+      * Math.sqrt(safeProgress);
+  }
+
+  // A diversified ETF can still have a bad day, but ordinary simulation noise
+  // should not produce single-stock-sized daily moves.
+  const dailyCap =
+    company.category === "Broad Market ETF" ? 0.035 : 0.030;
+
+  return clamp(logReturn, -dailyCap, dailyCap);
+}
+
+function etfCurrentTradingDayProgress(clock) {
+  if (!clock || clock.dayOfWeekIndex >= 5) return 1;
+
+  return clamp(
+    ((Number(clock.minuteOfDay) || 0) - 240) / 960,
+    0,
+    1
+  );
+}
+
+function buildNaturalEtfHistory(company, clock = marketClock()) {
+  const days = stockTradingDaysEndingAt(
+    clock.dayIndex,
+    STOCK_DAILY_HISTORY_LIMIT
+  );
+  if (!days.length) return [];
+
+  const handoffPrice = Math.max(
+    0.05,
+    Number(company.handoffPrice)
+      || Number(company.initialPrice)
+      || Number(company.price)
+      || 1
+  );
+
+  const closes = new Array(days.length);
+  const dayZeroIndex = days.indexOf(0);
+
+  if (dayZeroIndex >= 0) {
+    closes[dayZeroIndex] = handoffPrice;
+
+    // Build the pre-handoff fictional backstory backward from the exact real
+    // handoff price.
+    for (let i = dayZeroIndex - 1; i >= 0; i -= 1) {
+      const forwardDay = days[i + 1];
+      const forwardReturn = naturalEtfDailyLogReturn(
+        company,
+        forwardDay,
+        1
+      );
+
+      closes[i] = Math.max(
+        0.05,
+        closes[i + 1] / Math.exp(forwardReturn)
+      );
+    }
+
+    // Build every post-handoff trading day forward naturally. There is NO
+    // "force the final price to today's old value" correction. That was the
+    // reason the previous chart turned into an almost continuous staircase.
+    for (let i = dayZeroIndex + 1; i < days.length; i += 1) {
+      const day = days[i];
+      const progress =
+        day === clock.dayIndex
+          ? etfCurrentTradingDayProgress(clock)
+          : 1;
+
+      closes[i] = Math.max(
+        0.05,
+        closes[i - 1] * Math.exp(
+          naturalEtfDailyLogReturn(company, day, progress)
+        )
+      );
+    }
+  } else {
+    // If Day 0 is older than the visible window, reconstruct the displayed
+    // history backward from the ETF's long-run trend at the current date.
+    const trend = etfTrendPrice(company, clock);
+    closes[days.length - 1] = trend;
+
+    for (let i = days.length - 2; i >= 0; i -= 1) {
+      const forwardReturn = naturalEtfDailyLogReturn(
+        company,
+        days[i + 1],
+        1
+      );
+
+      closes[i] = Math.max(
+        0.05,
+        closes[i + 1] / Math.exp(forwardReturn)
+      );
+    }
+  }
+
+  const history = [];
+  for (let i = 0; i < days.length; i += 1) {
+    const close = Math.max(
+      0.05,
+      Number(closes[i]) || handoffPrice
+    );
+
+    const open = i > 0
+      ? Math.max(0.05, Number(closes[i - 1]) || close)
+      : Math.max(
+          0.05,
+          close / Math.exp(
+            naturalEtfDailyLogReturn(company, days[i], 1)
+          )
+        );
+
+    history.push(
+      makeStockDailyCandle(
+        company,
+        days[i],
+        open,
+        close
+      )
+    );
+  }
+
+  return history.slice(-STOCK_DAILY_HISTORY_LIMIT);
+}
+
 function applyEtfStabilityMigration(state, clock) {
   if (!state?.companies) return 0;
 
   let changed = 0;
 
   for (const company of Object.values(state.companies)) {
-    const classification = classifyStock(company.ticker, company.sector);
+    const classification = classifyStock(
+      company.ticker,
+      company.sector
+    );
     company.sector = classification.sector;
     company.category = classification.category;
     company.subcategory = classification.subcategory;
     company.industry = classification.industry;
 
     if (!isLongTermEtf(company)) continue;
+
     if (
       Number(company.etfStabilityModelVersion)
-      >= ETF_STABILITY_MODEL_VERSION
+        >= ETF_STABILITY_MODEL_VERSION
+      && Number(company.etfNaturalHistoryVersion)
+        >= ETF_NATURAL_HISTORY_VERSION
     ) {
       continue;
     }
 
-    const currentDisplayed = Math.max(
+    const beforeDisplayed = Math.max(
       0.05,
       Number(displayedPriceForAsset(company))
         || Number(company.price)
         || 1
     );
-    const trend = etfTrendPrice(company, clock);
-    const years = Math.max(
-      1 / 252,
-      etfTradingYearsSinceHandoff(clock)
-    );
-    const annualVol = Math.max(
-      0.01,
-      Number(company.annualVolatility) || 0.14
+
+    // Remove any leftover single-company event boost from older builds. ETFs
+    // should never be carrying an earnings/customer/product-news growth shock.
+    company.temporaryGrowth = 0;
+    company.temporaryGrowthUntil = 0;
+
+    // Rebuild VSS/CHHD ONCE using a genuine stochastic ETF path anchored to
+    // the exact handoff price. This replaces both the old runaway price and the
+    // artificial staircase history.
+    const naturalHistory = buildNaturalEtfHistory(
+      company,
+      clock
     );
 
-    // Three-sigma envelope around the ETF's long-term trend. This is wide
-    // enough for a real correction/rally, but prevents bugs/random company
-    // events from turning VSS/CHHD into meme stocks.
-    const maxLogDeviation = Math.max(
-      0.08,
-      3.0 * annualVol * Math.sqrt(years)
-    );
-
-    const currentLogDeviation = Math.log(
-      currentDisplayed / Math.max(0.05, trend)
-    );
-    const correctedLogDeviation = clamp(
-      currentLogDeviation,
-      -maxLogDeviation,
-      maxLogDeviation
-    );
-    const correctedDisplayed = Math.max(
-      0.05,
-      trend * Math.exp(correctedLogDeviation)
-    );
-
-    const overlayMultiplier = Math.exp(currentPlayerImpact(company));
-    const correctedBase = correctedDisplayed / Math.max(
-      0.000001,
-      overlayMultiplier
-    );
-
-    const relativeCorrection = Math.abs(
-      correctedDisplayed / currentDisplayed - 1
-    );
-
-    if (relativeCorrection > 0.0005) {
-      console.log(
-        `[ETF STABILITY] ${company.ticker}: correcting impossible legacy ` +
-        `move $${currentDisplayed.toFixed(2)} -> ` +
-        `$${correctedDisplayed.toFixed(2)} ` +
-        `(trend $${trend.toFixed(2)}, ` +
-        `3σ band ${(maxLogDeviation * 100).toFixed(1)}%).`
+    if (naturalHistory.length > 0) {
+      const naturalDisplayed = Math.max(
+        0.05,
+        Number(naturalHistory[naturalHistory.length - 1].c)
+          || beforeDisplayed
       );
 
-      company.price = Math.max(0.05, correctedBase);
+      const overlayMultiplier = Math.exp(
+        currentPlayerImpact(company)
+      );
+      company.price = Math.max(
+        0.05,
+        naturalDisplayed / Math.max(
+          0.000001,
+          overlayMultiplier
+        )
+      );
+
       company.companyValue = Math.max(
         2e6,
         company.price
-          * Math.max(1, Number(company.sharesOutstanding) || 1)
+          * Math.max(
+            1,
+            Number(company.sharesOutstanding) || 1
+          )
       );
 
-      // The persisted 1D history may have been bootstrapped from the already
-      // inflated legacy price. Rebuild it ONCE from the corrected price.
-      company.dailyHistory = [];
-      company.dailyHistoryVersion = 0;
+      company.dailyHistory = naturalHistory;
+      company.dailyHistoryVersion = STOCK_DAILY_HISTORY_VERSION;
       company.candles = company.candles || {};
-      delete company.candles["1d"];
+      company.candles["1d"] = naturalHistory;
+      touchCandleSeries("stock", company.ticker, "1d");
+
+      console.log(
+        `[ETF NATURAL MOVEMENT] ${company.ticker}: ` +
+        `$${beforeDisplayed.toFixed(2)} -> ` +
+        `$${naturalDisplayed.toFixed(2)}. ` +
+        `Rebuilt 1D history from exact handoff with natural ` +
+        `red/green days and normal ETF volatility.`
+      );
 
       changed += 1;
     }
 
     company.etfStabilityModelVersion =
       ETF_STABILITY_MODEL_VERSION;
+    company.etfNaturalHistoryVersion =
+      ETF_NATURAL_HISTORY_VERSION;
   }
 
   return changed;
@@ -3783,65 +3982,85 @@ function updateEtfCompany(company, elapsedGameMinutes, clock, factors) {
 
   if (!clock.isTradingAllowed) return;
 
-  const sharedFactor = stockFactorFromRuntime(company, factors);
-  const effectiveGrowth =
-    company.annualGrowth
-    + (
-      clock.totalMinutes < Number(company.temporaryGrowthUntil || 0)
-        ? Number(company.temporaryGrowth || 0)
-        : 0
-    );
+  const sharedFactor = stockFactorFromRuntime(
+    company,
+    factors
+  );
 
-  // Positive long-term price drift. CHHD's larger dividend yield means its
-  // PRICE growth is intentionally slower than VSS even though total return is
-  // similar.
+  // ETFs receive only their normal long-term drift. Legacy corporate-news
+  // temporaryGrowth is intentionally ignored.
   const drift =
-    effectiveGrowth
+    (Number(company.annualGrowth) || 0)
     * elapsedGameMinutes
     / (252 * 960);
 
-  // ETF volatility remains real: they can dip, correct, and have bad weeks.
-  // They just no longer receive single-company style shocks.
+  // Brownian market movement gives real ups AND downs. Extended-hours noise is
+  // quieter than regular-session movement.
   const randomMove =
-    company.annualVolatility
-    * (clock.session === "open" ? 1 : 0.52)
+    (Number(company.annualVolatility) || 0.14)
+    * (clock.session === "open" ? 1 : 0.38)
     * sharedFactor
-    * Math.sqrt(elapsedGameMinutes / (252 * 960));
+    * Math.sqrt(
+      elapsedGameMinutes / (252 * 960)
+    );
 
-  // Weak long-horizon pull toward the intended upward ETF trend. This does NOT
-  // prevent normal drawdowns; it prevents a broad/dividend ETF from drifting
-  // 40-60% away from its intended long-run path because of accumulated noise.
   const trend = etfTrendPrice(company, clock);
-  const currentBase = Math.max(0.05, Number(company.price) || 0.05);
-  const logDeviation = Math.log(currentBase / Math.max(0.05, trend));
+  const currentBase = Math.max(
+    0.05,
+    Number(company.price) || 0.05
+  );
+  const logDeviation = Math.log(
+    currentBase / Math.max(0.05, trend)
+  );
+
+  // Do not constantly "pull upward." Inside a normal trading band the ETF is
+  // allowed to wander freely. Mean reversion starts only after a material
+  // deviation, and even then it is intentionally slow.
+  const deadband =
+    company.category === "Broad Market ETF"
+      ? 0.10
+      : 0.085;
+
+  const excessDeviation =
+    Math.abs(logDeviation) > deadband
+      ? Math.sign(logDeviation)
+        * (Math.abs(logDeviation) - deadband)
+      : 0;
 
   const halfLifeTradingDays =
-    company.category === "Broad Market ETF" ? 55 : 45;
+    company.category === "Broad Market ETF"
+      ? 180
+      : 150;
 
   const reversionStrength = clamp(
     Math.LN2
       * elapsedGameMinutes
       / (halfLifeTradingDays * 960),
     0,
-    0.08
+    0.02
   );
 
-  const trendPull = -logDeviation * reversionStrength;
+  const trendPull =
+    -excessDeviation * reversionStrength;
 
   company.price = Math.max(
     0.05,
-    currentBase * Math.exp(drift + randomMove + trendPull)
+    currentBase * Math.exp(
+      drift + randomMove + trendPull
+    )
   );
 
-  // For these ETF stand-ins, NAV/company value follows the fund price instead
-  // of receiving unrelated corporate-value shocks.
   company.companyValue = Math.max(
     2e6,
     company.price
-      * Math.max(1, Number(company.sharesOutstanding) || 1)
+      * Math.max(
+        1,
+        Number(company.sharesOutstanding) || 1
+      )
   );
 
-  const currentDisplayedPrice = displayedPriceForAsset(company);
+  const currentDisplayedPrice =
+    displayedPriceForAsset(company);
 
   updateStockDailyHistory(
     company,
