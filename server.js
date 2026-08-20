@@ -1253,24 +1253,40 @@ const WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE = clamp(
   1,
   60
 );
-const WEEKEND_REAL_SECONDS_PER_GAME_MINUTE = clamp(
-  Number(process.env.FICTIONAL_WEEKEND_REAL_SECONDS_PER_GAME_MINUTE) || 5,
-  1,
+
+// Fully-closed weekday periods run 2x faster than normal weekday time.
+const WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE = clamp(
+  Number(process.env.FICTIONAL_WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE)
+    || (WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE / 2),
+  0.25,
   60
 );
-const VARIABLE_CLOCK_SPEED_MODE = "weekday-15s-weekend-5s-v1";
 
-function realSecondsPerGameMinuteForGameSecond(
+// Weekends were already accelerated to 5 sec/game-minute. They are fully
+// closed, so "2x faster when closed" makes weekends 2.5 sec/game-minute.
+const WEEKEND_REAL_SECONDS_PER_GAME_MINUTE = clamp(
+  Number(process.env.FICTIONAL_WEEKEND_REAL_SECONDS_PER_GAME_MINUTE) || 2.5,
+  0.25,
+  60
+);
+
+const VARIABLE_CLOCK_SPEED_MODE = "market-closed-2x-v2";
+
+function legacyRealSecondsPerGameMinuteForGameSecond(
   totalGameSeconds,
-  weekdayRate = WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-  weekendRate = WEEKEND_REAL_SECONDS_PER_GAME_MINUTE
+  weekdayRate,
+  weekendRate
 ) {
   const safeGameSeconds = Math.max(0, Number(totalGameSeconds) || 0);
-  const dayIndex = Math.floor(safeGameSeconds / (MINUTES_PER_DAY * 60));
+  const dayIndex = Math.floor(
+    safeGameSeconds / (MINUTES_PER_DAY * 60)
+  );
   const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
   return dayOfWeekIndex >= 5 ? weekendRate : weekdayRate;
 }
 
+// Kept only for migration from the previous weekday/weekend-only speed model,
+// so deployment preserves the exact fictional clock position.
 function advanceGameSecondsByRealMsWithRates(
   startGameSeconds,
   elapsedRealMs,
@@ -1280,21 +1296,27 @@ function advanceGameSecondsByRealMsWithRates(
   let gameSeconds = Math.max(0, Number(startGameSeconds) || 0);
   let remainingRealMs = Math.max(0, Number(elapsedRealMs) || 0);
 
-  const safeWeekdayRate = clamp(Number(weekdayRate) || 15, 1, 60);
-  const safeWeekendRate = clamp(Number(weekendRate) || safeWeekdayRate, 1, 60);
+  const safeWeekdayRate = clamp(Number(weekdayRate) || 15, 0.25, 60);
+  const safeWeekendRate = clamp(
+    Number(weekendRate) || safeWeekdayRate,
+    0.25,
+    60
+  );
   const gameSecondsPerDay = MINUTES_PER_DAY * 60;
 
-  // Integrate across in-game day boundaries because weekends run faster.
-  // Even after months of downtime this loop only runs once per crossed game day.
   while (remainingRealMs > 0.0001) {
-    const rate = realSecondsPerGameMinuteForGameSecond(
+    const rate = legacyRealSecondsPerGameMinuteForGameSecond(
       gameSeconds,
       safeWeekdayRate,
       safeWeekendRate
     );
 
-    const currentDayIndex = Math.floor(gameSeconds / gameSecondsPerDay);
-    const nextDayGameSecond = (currentDayIndex + 1) * gameSecondsPerDay;
+    const currentDayIndex = Math.floor(
+      gameSeconds / gameSecondsPerDay
+    );
+    const nextDayGameSecond =
+      (currentDayIndex + 1) * gameSecondsPerDay;
+
     const gameSecondsToBoundary = Math.max(
       0.000001,
       nextDayGameSecond - gameSeconds
@@ -1314,13 +1336,100 @@ function advanceGameSecondsByRealMsWithRates(
   return gameSeconds;
 }
 
-function advanceGameSecondsByRealMs(startGameSeconds, elapsedRealMs) {
-  return advanceGameSecondsByRealMsWithRates(
-    startGameSeconds,
-    elapsedRealMs,
-    WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-    WEEKEND_REAL_SECONDS_PER_GAME_MINUTE
+function realSecondsPerGameMinuteForGameSecond(totalGameSeconds) {
+  const safeGameSeconds = Math.max(
+    0,
+    Number(totalGameSeconds) || 0
   );
+  const gameSecondsPerDay = MINUTES_PER_DAY * 60;
+  const dayIndex = Math.floor(
+    safeGameSeconds / gameSecondsPerDay
+  );
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+
+  // Entire Saturday/Sunday period is closed.
+  if (dayOfWeekIndex >= 5) {
+    return WEEKEND_REAL_SECONDS_PER_GAME_MINUTE;
+  }
+
+  const secondsIntoDay =
+    ((safeGameSeconds % gameSecondsPerDay) + gameSecondsPerDay)
+    % gameSecondsPerDay;
+  const minuteOfDay = secondsIntoDay / 60;
+
+  // Stocks are tradeable from 4:00 AM through 8:00 PM (pre-market,
+  // regular market, after-hours). Only the fully closed overnight period
+  // receives the 2x speed boost.
+  if (minuteOfDay >= 240 && minuteOfDay < 1200) {
+    return WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE;
+  }
+
+  return WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE;
+}
+
+function nextClockSpeedBoundaryGameSecond(totalGameSeconds) {
+  const safeGameSeconds = Math.max(
+    0,
+    Number(totalGameSeconds) || 0
+  );
+  const gameSecondsPerDay = MINUTES_PER_DAY * 60;
+  const dayIndex = Math.floor(
+    safeGameSeconds / gameSecondsPerDay
+  );
+  const dayStart = dayIndex * gameSecondsPerDay;
+  const dayOfWeekIndex = ((dayIndex % 7) + 7) % 7;
+  const secondsIntoDay = safeGameSeconds - dayStart;
+
+  // Weekends stay at one speed all day, so midnight is the only boundary.
+  if (dayOfWeekIndex >= 5) {
+    return dayStart + gameSecondsPerDay;
+  }
+
+  const fourAm = 240 * 60;
+  const eightPm = 1200 * 60;
+
+  if (secondsIntoDay < fourAm) {
+    return dayStart + fourAm;
+  }
+  if (secondsIntoDay < eightPm) {
+    return dayStart + eightPm;
+  }
+
+  return dayStart + gameSecondsPerDay;
+}
+
+function advanceGameSecondsByRealMs(startGameSeconds, elapsedRealMs) {
+  let gameSeconds = Math.max(0, Number(startGameSeconds) || 0);
+  let remainingRealMs = Math.max(0, Number(elapsedRealMs) || 0);
+
+  // Integrate exactly across 4 AM, 8 PM, midnight, and weekend boundaries,
+  // because the fictional clock changes speed at those points.
+  while (remainingRealMs > 0.0001) {
+    const rate = realSecondsPerGameMinuteForGameSecond(
+      gameSeconds
+    );
+    const boundary = nextClockSpeedBoundaryGameSecond(
+      gameSeconds
+    );
+
+    const gameSecondsToBoundary = Math.max(
+      0.000001,
+      boundary - gameSeconds
+    );
+    const realMsToBoundary =
+      gameSecondsToBoundary * rate * 1000 / 60;
+
+    if (remainingRealMs < realMsToBoundary) {
+      gameSeconds +=
+        remainingRealMs * 60 / (rate * 1000);
+      remainingRealMs = 0;
+    } else {
+      gameSeconds = boundary;
+      remainingRealMs -= realMsToBoundary;
+    }
+  }
+
+  return gameSeconds;
 }
 
 const CLOCK_START_MINUTE = clamp(
@@ -2298,15 +2407,20 @@ function marketClock(nowMs = Date.now()) {
     earlyCloseName: "",
     regularCloseMinute: 960,
     realSecondsPerGameMinute:
-      dayOfWeekIndex >= 5
-        ? WEEKEND_REAL_SECONDS_PER_GAME_MINUTE
-        : WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
+      realSecondsPerGameMinuteForGameSecond(totalGameSeconds),
     realSecondsPerGameDay:
-      (dayOfWeekIndex >= 5
-        ? WEEKEND_REAL_SECONDS_PER_GAME_MINUTE
-        : WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE) * MINUTES_PER_DAY,
-    weekdayRealSecondsPerGameMinute: WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-    weekendRealSecondsPerGameMinute: WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
+      dayOfWeekIndex >= 5
+        ? WEEKEND_REAL_SECONDS_PER_GAME_MINUTE * MINUTES_PER_DAY
+        : (
+          WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE * 480
+          + WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE * 960
+        ),
+    weekdayRealSecondsPerGameMinute:
+      WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayClosedRealSecondsPerGameMinute:
+      WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE,
+    weekendRealSecondsPerGameMinute:
+      WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
     clockSpeedMode: VARIABLE_CLOCK_SPEED_MODE,
     nextEventText: nextSessionText(dayOfWeekIndex, minuteOfDay, session)
   };
@@ -2404,8 +2518,12 @@ function newMarketState() {
     clockAnchorRealMs: Date.now(),
     clockAnchorGameSeconds: CLOCK_START_MINUTE * 60,
     realSecondsPerGameMinute: WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-    weekdayRealSecondsPerGameMinute: WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-    weekendRealSecondsPerGameMinute: WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayRealSecondsPerGameMinute:
+      WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayClosedRealSecondsPerGameMinute:
+      WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE,
+    weekendRealSecondsPerGameMinute:
+      WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
     lastUpdatedGameMinute: CLOCK_START_MINUTE,
     lastUpdatedGameSecond: CLOCK_START_MINUTE * 60,
     dailyChangeModelVersion: DAILY_CHANGE_MODEL_VERSION,
@@ -2846,17 +2964,36 @@ function loadState() {
         : 30);
 
     const priorWeekendRate =
-      priorClockSpeedMode === VARIABLE_CLOCK_SPEED_MODE
+      priorClockSpeedMode === "weekday-15s-weekend-5s-v1"
         ? (
           Number(marketState.weekendRealSecondsPerGameMinute)
-          || priorWeekdayRate
+          || 5
         )
-        : priorWeekdayRate;
+        : priorClockSpeedMode === VARIABLE_CLOCK_SPEED_MODE
+          ? (
+            Number(marketState.weekendRealSecondsPerGameMinute)
+            || WEEKEND_REAL_SECONDS_PER_GAME_MINUTE
+          )
+          : priorWeekdayRate;
+
+    const priorWeekdayClosedRate =
+      Number(marketState.weekdayClosedRealSecondsPerGameMinute)
+      || priorWeekdayRate;
 
     const speedConfigurationChanged =
       priorClockSpeedMode !== VARIABLE_CLOCK_SPEED_MODE
-      || Math.abs(priorWeekdayRate - WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE) > 1e-9
-      || Math.abs(priorWeekendRate - WEEKEND_REAL_SECONDS_PER_GAME_MINUTE) > 1e-9;
+      || Math.abs(
+        priorWeekdayRate
+        - WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE
+      ) > 1e-9
+      || Math.abs(
+        priorWeekdayClosedRate
+        - WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE
+      ) > 1e-9
+      || Math.abs(
+        priorWeekendRate
+        - WEEKEND_REAL_SECONDS_PER_GAME_MINUTE
+      ) > 1e-9;
 
     if (speedConfigurationChanged) {
       // Preserve the exact fictional clock position at deployment.
@@ -2869,16 +3006,22 @@ function loadState() {
         nowMs - Number(marketState.clockAnchorRealMs)
       );
 
-      marketState.clockAnchorGameSeconds = Math.max(
-        0,
-        Math.floor(
-          advanceGameSecondsByRealMsWithRates(
+      const migratedGameSeconds =
+        priorClockSpeedMode === VARIABLE_CLOCK_SPEED_MODE
+          ? advanceGameSecondsByRealMs(
+            Number(marketState.clockAnchorGameSeconds),
+            elapsedRealMs
+          )
+          : advanceGameSecondsByRealMsWithRates(
             Number(marketState.clockAnchorGameSeconds),
             elapsedRealMs,
             priorWeekdayRate,
             priorWeekendRate
-          )
-        )
+          );
+
+      marketState.clockAnchorGameSeconds = Math.max(
+        0,
+        Math.floor(migratedGameSeconds)
       );
       marketState.clockAnchorRealMs = nowMs;
     }
@@ -2888,6 +3031,8 @@ function loadState() {
       WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE;
     marketState.weekdayRealSecondsPerGameMinute =
       WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE;
+    marketState.weekdayClosedRealSecondsPerGameMinute =
+      WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE;
     marketState.weekendRealSecondsPerGameMinute =
       WEEKEND_REAL_SECONDS_PER_GAME_MINUTE;
 
@@ -5080,8 +5225,12 @@ app.get("/health", (_req, res) => {
     clockSpeedMode: VARIABLE_CLOCK_SPEED_MODE,
     realSecondsPerGameMinute: clock.realSecondsPerGameMinute,
     realSecondsPerGameDay: clock.realSecondsPerGameDay,
-    weekdayRealSecondsPerGameMinute: WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-    weekendRealSecondsPerGameMinute: WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayRealSecondsPerGameMinute:
+      WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayClosedRealSecondsPerGameMinute:
+      WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE,
+    weekendRealSecondsPerGameMinute:
+      WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
     automaticIposEnabled: false,
     handoffReady: marketState.handoffReady === true,
     automaticHandoffInProgress,
@@ -5299,8 +5448,12 @@ app.get("/fictional/market/status", (_req, res) => {
     holidaysIgnored: true,
     realSecondsPerGameMinute: clock.realSecondsPerGameMinute,
     realSecondsPerGameDay: clock.realSecondsPerGameDay,
-    weekdayRealSecondsPerGameMinute: WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
-    weekendRealSecondsPerGameMinute: WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayRealSecondsPerGameMinute:
+      WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE,
+    weekdayClosedRealSecondsPerGameMinute:
+      WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE,
+    weekendRealSecondsPerGameMinute:
+      WEEKEND_REAL_SECONDS_PER_GAME_MINUTE,
     clockMode: "accelerated-fictional-week",
     clockSpeedMode: VARIABLE_CLOCK_SPEED_MODE,
     companyCount: Object.keys(marketState.companies).length,
@@ -5668,7 +5821,9 @@ async function startServer() {
     console.log(
       `[SERVER] Fictional clock currently ${clock.dayName} ${clock.exactTime}; ` +
       `1 game minute = ${clock.realSecondsPerGameMinute} real seconds right now ` +
-      `(weekdays ${WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE}s, weekends ${WEEKEND_REAL_SECONDS_PER_GAME_MINUTE}s).`
+      `(weekday tradeable ${WEEKDAY_REAL_SECONDS_PER_GAME_MINUTE}s, ` +
+      `weekday closed ${WEEKDAY_CLOSED_REAL_SECONDS_PER_GAME_MINUTE}s, ` +
+      `weekends ${WEEKEND_REAL_SECONDS_PER_GAME_MINUTE}s).`
     );
 
     if (marketState.handoffReady === true) {
